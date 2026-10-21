@@ -71,30 +71,57 @@ class CloudflareProvider(Provider):
 
     def measure_latency(self, server: Server, count: int = 5,
                         timeout: float = 10.0) -> LatencyResult:
-        """Time a TCP connect plus TLS handshake to speed.cloudflare.com.
+        """Measure the steady-state RTT to speed.cloudflare.com.
 
-        There is no HTTP latency endpoint on this API, so the honest
-        measurement is the cost of establishing the connection we are about
-        to use. We report exactly that and say so in the UI.
+        Cloudflare has no "latency.txt" endpoint, but it does have
+        `__down?bytes=0`, which answers 200 with an empty body. On a warm
+        connection that measures the round trip on the link, which is
+        what we want and what makes the number comparable to the other
+        providers.
+
+        The TCP and TLS handshake is a separate thing: a one-off setup
+        cost, not the latency of the link. We measure it once and report
+        it separately, because averaging it into the latency would
+        inflate every sample.
         """
+        import ssl
+
+        from ..httpconn import LatencyConnection, ProbeError, ok
+
         result = LatencyResult()
-        for _ in range(count):
-            result.attempts += 1
-            start = time.perf_counter()
+
+        # The handshake, measured once, on its own.
+        start = time.perf_counter()
+        try:
+            sock = socket.create_connection(("speed.cloudflare.com", 443),
+                                            timeout=timeout)
             try:
-                sock = socket.create_connection(("speed.cloudflare.com", 443),
-                                                timeout=timeout)
+                sock.settimeout(timeout)
+                ctx = ssl.create_default_context()
+                with ctx.wrap_socket(sock,
+                                     server_hostname="speed.cloudflare.com"):
+                    result.handshake_ms = (time.perf_counter() - start) * 1000
+            finally:
+                sock.close()
+        except (TimeoutError, OSError):
+            result.errors += 1
+
+        conn = LatencyConnection(BASE, ua=self.ua, timeout=timeout,
+                                 validator=ok)
+        try:
+            if conn.warm_up("/__down", "bytes=0"):
+                result.attempts += 1
+            for i in range(count):
+                result.attempts += 1
+                stamp = int(time.time() * 1000)
                 try:
-                    sock.settimeout(timeout)
-                    # TLS handshake, so we measure the real cost of a request
-                    ctx = __import__("ssl").create_default_context()
-                    with ctx.wrap_socket(sock, server_hostname="speed.cloudflare.com"):
-                        result.samples_ms.append(
-                            (time.perf_counter() - start) * 1000)
-                finally:
-                    sock.close()
-            except (TimeoutError, OSError):
-                result.errors += 1
+                    rtt = conn.probe("/__down", f"{stamp}.{i}",
+                                     query=f"bytes=0&x={stamp}.{i}")
+                    result.samples_ms.append(rtt)
+                except ProbeError:
+                    result.errors += 1
+        finally:
+            conn.close()
         return result
 
     def measure_download(self, server: Server, duration: float = 10.0,

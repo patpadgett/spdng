@@ -29,11 +29,10 @@ def result_table(result, fun_on: bool = True) -> str:
 
     lat = result.latency
     if lat.avg_ms is not None:
-        t.add_row([
-            "Ping",
-            f"{lat.avg_ms:.2f} ms",
-            f"jitter {lat.jitter_ms:.2f} ms   loss {lat.loss_pct:.0f}%",
-        ])
+        detail = f"jitter {lat.jitter_ms:.2f} ms   loss {lat.loss_pct:.0f}%"
+        if lat.handshake_ms is not None:
+            detail += f"   setup {lat.handshake_ms:.0f} ms"
+        t.add_row(["Ping", f"{lat.avg_ms:.2f} ms", detail])
     else:
         t.add_row([
             "Ping",

@@ -33,7 +33,6 @@ from ..measure import (
     DEFAULT_UA,
     LatencyResult,
     ThroughputResult,
-    _opener,
     download_worker,
     upload_worker,
 )
@@ -207,27 +206,30 @@ class LibreSpeedProvider(Provider):
 
     def measure_latency(self, server: Server, count: int = 5,
                         timeout: float = 10.0) -> LatencyResult:
+        """Measure latency over a warm, persistent connection.
+
+        The first exchange pays the TCP and TLS handshake, so it is
+        discarded rather than reported as a latency sample.
+        """
+        from ..httpconn import LatencyConnection, ProbeError, ok
+
         result = LatencyResult()
-        opener = _opener(self.ua)
         url = self._endpoints(server)["ping"]
-        for i in range(count):
-            result.attempts += 1
-            sep = "&" if "?" in url else "?"
-            target = f"{url}{sep}x={int(time.time() * 1000)}.{i}"
-            start = time.perf_counter()
-            try:
-                req = urllib.request.Request(target, headers={
-                    "User-Agent": self.ua, "Accept": "*/*",
-                    "Connection": "close"})
-                with opener.open(req, timeout=timeout) as resp:
-                    resp.read(64)
-                    if resp.status == 200:
-                        result.samples_ms.append(
-                            (time.perf_counter() - start) * 1000)
-                    else:
-                        result.errors += 1
-            except (urllib.error.URLError, OSError):
-                result.errors += 1
+        conn = LatencyConnection(url, ua=self.ua, timeout=timeout,
+                                 validator=ok)
+        try:
+            if conn.warm_up("/empty.php"):
+                result.attempts += 1
+            for i in range(count):
+                result.attempts += 1
+                stamp = int(time.time() * 1000)
+                try:
+                    rtt = conn.probe("/empty.php", f"{stamp}.{i}")
+                    result.samples_ms.append(rtt)
+                except ProbeError:
+                    result.errors += 1
+        finally:
+            conn.close()
         return result
 
     def measure_download(self, server: Server, duration: float = 10.0,

@@ -287,8 +287,10 @@ def test_live_librespeed_provider():
     assert srv, "no LibreSpeed servers returned"
     lat = provider.measure_latency(srv[0], count=2, timeout=15)
     # Some community servers are unreachable from anywhere; that is fine,
-    # we only assert that the call returns cleanly.
-    assert lat.attempts == 2
+    # we only assert that the call returns cleanly. The attempt count is
+    # the warm-up plus the probes, because the warm-up is a real request.
+    assert lat.attempts >= 2
+    assert lat.attempts <= 4
 
 
 # --------------------------------------------------------------------------

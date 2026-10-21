@@ -341,3 +341,77 @@ def test_trace_table_is_aligned():
     assert len(widths) == 1, f"ragged trace table: {widths}"
     assert "..." in out
     assert "ooo" in out
+
+
+# --------------------------------------------------------------------------
+# the comparison view
+# --------------------------------------------------------------------------
+
+def _comp_result(name: str, dl: float, ping: float):
+    from spdng.measure import LatencyResult, SpeedTestResult
+
+    class FakeServer:
+        sponsor = "Sponsor"
+        cc = "US"
+        distance_km = 5.0
+        provider = "ookla"
+
+    FakeServer.name = name
+    r = SpeedTestResult(server=FakeServer())
+    r.download_mbps = dl
+    r.upload_mbps = 10.0
+    r.latency = LatencyResult(samples_ms=[ping], errors=0, attempts=1)
+    return r
+
+
+def test_comparison_rows_line_up():
+    """Every row of the comparison must start its columns in the same place."""
+    style.set_color(False)
+    from spdng import compare
+    out = compare.render_comparison(
+        [_comp_result("A", 100.0, 20.0), _comp_result("B", 200.0, 30.0)],
+        ["one", "two"])
+    for line in out.split("\n"):
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"─"}:
+            continue
+        # A label-only row (the "Server" heading) has no data columns.
+        if len(line) <= 11:
+            continue
+        # The label column is 11 wide, so every row's first data
+        # character sits at the same offset.
+        assert line[11] != " ", f"row is not indented to the label column: {line!r}"
+
+
+def test_comparison_server_row_is_one_line_per_provider():
+    style.set_color(False)
+    from spdng import compare
+    out = compare.render_comparison(
+        [_comp_result("A", 100.0, 20.0), _comp_result("B", 200.0, 30.0)],
+        ["one", "two"])
+    lines = [line for line in out.split("\n") if line.strip()]
+    server_idx = next(i for i, line in enumerate(lines)
+                      if line.startswith("Server"))
+    # The row after "Server" holds all the servers, not one per line.
+    assert "A" in lines[server_idx + 1]
+    assert "B" in lines[server_idx + 1]
+
+
+def test_shorten_cuts_at_a_word_boundary():
+    from spdng.compare import _shorten
+    out = _shorten("Blue Stream Fiber Miami, Florida", 20)
+    assert len(out) <= 20
+    assert out.endswith("…")
+    assert "Blue Stream" in out
+
+
+def test_shorten_leaves_short_text_alone():
+    from spdng.compare import _shorten
+    assert _shorten("Miami", 20) == "Miami"
+
+
+def test_shorten_never_returns_something_longer():
+    from spdng.compare import _shorten
+    for width in range(2, 30):
+        out = _shorten("A Very Long Sponsor Name Indeed", width)
+        assert len(out) <= width

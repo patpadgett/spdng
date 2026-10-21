@@ -12,6 +12,24 @@ from . import style
 from .measure import SpeedTestResult
 
 
+def _shorten(text: str, width: int) -> str:
+    """Shorten a label to fit a column, at a word boundary.
+
+    Cutting mid-word produces something that looks like a real name, so
+    the last word is dropped instead and an ellipsis marks the cut.
+    """
+    from .table import visible_width
+    if visible_width(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    cut = text[:width - 1]
+    space = cut.rfind(" ")
+    if space > width // 2:
+        cut = cut[:space]
+    return cut.rstrip() + "…"
+
+
 def _fmt(value: float | None, unit: str, decimals: int = 2) -> str:
     if value is None:
         return "n/a"
@@ -64,21 +82,26 @@ def render_comparison(results: Sequence[SpeedTestResult],
     out = [style.paint(f"{'':<{label_w}}{header}", "heading")]
     out.append(style.paint("─" * min(total, label_w + col_w * n), "dim"))
 
+    # The server details go in their own row, one column per provider, so
+    # they line up with the numbers below. A long sponsor name is
+    # shortened at a word boundary rather than cut mid-word, because a
+    # truncated name reads as a real name.
     out.append(style.paint(f"{'Server':<{label_w}}", "muted"))
-    for i, r in enumerate(results):
+    server_cells = []
+    for r in results:
         srv = r.server
         detail = f"{srv.sponsor} {srv.name}" if srv is not None else "?"
-        out.append(f"{'':<{label_w}}{style.paint(detail, 'muted')}")
-        if i < len(results) - 1:
-            out.append("")
+        server_cells.append(style.paint(_shorten(detail, col_w), "muted"))
+    out.append(row("", server_cells))
 
     out.append(style.paint(f"{'Provider':<{label_w}}", "muted"))
+    prov_cells = []
     for r in results:
         srv = r.server
         prov = getattr(srv, "provider", "?") if srv else "?"
         dist = f"{srv.distance_km:.0f} km" if srv and srv.distance_km else "-"
-        out.append(f"{'':<{label_w}}{style.paint(prov, 'accent')}  "
-                   f"{style.paint(dist, 'muted')}")
+        prov_cells.append(f"{style.paint(prov, 'accent')} {dist}")
+    out.append(row("", prov_cells))
 
     out.append("")
     downloads = [r.download_mbps for r in results]

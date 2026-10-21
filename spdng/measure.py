@@ -37,6 +37,11 @@ class LatencyResult:
     samples_ms: list[float] = field(default_factory=list)
     errors: int = 0
     attempts: int = 0
+    #: The cost of establishing the connection, when the provider can
+    #: measure it. This is NOT the latency of the link: it is a
+    #: one-off setup cost, and averaging it into the latency would
+    #: inflate every number by it.
+    handshake_ms: float | None = None
 
     @property
     def loss_pct(self) -> float:

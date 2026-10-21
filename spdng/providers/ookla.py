@@ -12,15 +12,11 @@ redirect entirely, which is one full round trip saved.
 from __future__ import annotations
 
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
 from ..measure import (
     DEFAULT_UA,
     LatencyResult,
     ThroughputResult,
-    _opener,
     download_worker,
     upload_worker,
 )
@@ -54,26 +50,33 @@ class OoklaProvider(Provider):
 
     def measure_latency(self, server: Server, count: int = 5,
                         timeout: float = 10.0) -> LatencyResult:
+        """Measure latency over a warm, persistent connection.
+
+        The connection is opened once and the first exchange is discarded:
+        it measures the TCP and TLS handshake, which is around 100 ms to
+        a nearby server and is not the latency of the link. A single slow
+        handshake used to drag the reported average up by hundreds of
+        milliseconds, which made a healthy link look broken.
+        """
+        from ..httpconn import LatencyConnection, ProbeError
+
         result = LatencyResult()
-        opener = _opener(self.ua)
-        for i in range(count):
-            result.attempts += 1
-            stamp = int(time.time() * 1000)
-            url = f"{server.base}/latency.txt?x={stamp}.{i}"
-            start = time.perf_counter()
-            try:
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": self.ua, "Accept": "*/*",
-                    "Connection": "close"})
-                with opener.open(req, timeout=timeout) as resp:
-                    body = resp.read(16)
-                    rtt = (time.perf_counter() - start) * 1000
-                    if resp.status == 200 and body.strip() == b"test=test":
-                        result.samples_ms.append(rtt)
-                    else:
-                        result.errors += 1
-            except (urllib.error.URLError, OSError):
-                result.errors += 1
+        conn = LatencyConnection(server.base, ua=self.ua, timeout=timeout)
+        try:
+            # The warm-up is an attempt but not a sample: it is the
+            # handshake, not a measurement of the link.
+            if conn.warm_up():
+                result.attempts += 1
+            for i in range(count):
+                result.attempts += 1
+                stamp = int(time.time() * 1000)
+                try:
+                    rtt = conn.probe("/latency.txt", f"{stamp}.{i}")
+                    result.samples_ms.append(rtt)
+                except ProbeError:
+                    result.errors += 1
+        finally:
+            conn.close()
         return result
 
     def measure_download(self, server: Server, duration: float = 10.0,
