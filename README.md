@@ -9,9 +9,15 @@ archived since July 2024 with its last release in **April 2021**. Homebrew
 formally deprecated it as `:unmaintained` on 2026-01-18 and scheduled it for
 removal on 2027-01-18.
 
-It does everything speedtest-cli does, correctly, and adds the thing
-speedtest-cli never had: an **mtr-style per-hop trace** to the test server,
-so you can see which router is eating your packets.
+It does everything speedtest-cli does, correctly, and adds three things
+speedtest-cli never had:
+
+- an **mtr-style per-hop trace** to the test server, so you can see which
+  router is eating your packets
+- **multiple providers**, so you can measure against more than one network
+  and find out whether your link is slow or just slow to one destination
+- a **local history**, so you can see whether your connection is getting
+  worse
 
 ```
 $ spdng speedtest --trace
@@ -24,7 +30,6 @@ Hop   Loss%  Snt       Last        Avg       Best      Worst   Jitter  Address
 ------------------------------------------------------------------------------
   1    0.0%    3   ~3.79 ms   ~4.59 ms    3.79 ms    5.07 ms     0.64  192.168.1.1
   2    0.0%    3   ~4.58 ms   ~4.42 ms    3.82 ms    4.86 ms     0.90  72.187.94.43
-  3  100.0%    3        ---        ---        ---        ---      ---  *
  10    0.0%    3  ~18.49 ms  ~20.20 ms   18.49 ms   21.86 ms     1.69  66.109.6.96
  11    0.0%    3  ~27.13 ms  ~24.88 ms   21.52 ms   27.13 ms     2.80  66.109.5.127
  12    0.0%    3  ~22.80 ms  ~20.42 ms   18.51 ms   22.80 ms     2.14  208.116.217.205
@@ -47,8 +52,8 @@ reported. See [Measurement honesty](#measurement-honesty).
 
 ## Why speedtest-cli is broken
 
-I installed speedtest-cli 2.1.3 and measured it. It is not a matter of taste
-or age; it reports **wrong numbers**. Four independent defects, each
+I installed speedtest-cli 2.1.3 and measured it. It is not a matter of
+taste or age; it reports **wrong numbers**. Four independent defects, each
 reproducible with `proof.py` in this repo:
 
 ### 1. It never follows HTTP redirects
@@ -102,7 +107,57 @@ speed.
 
 `spdng` uses the geo-aware `api/js/servers` endpoint, ranks by **distance
 first**, and talks to the canonical hostname directly (skipping the 307
-saves a round trip and roughly halves the measured latency).
+saves a round trip and roughly halves the measured latency: 46 ms direct
+versus 128 ms via the redirect).
+
+---
+
+## Whose infrastructure is this?
+
+Good question, and one the old tool never answered. `spdng` supports three
+networks, and you can compare them:
+
+| provider | what it measures | whose infrastructure |
+|---|---|---|
+| `ookla` | the nearest speedtest server, chosen by distance | Ookla's server network (a commercial company; this API is unofficial) |
+| `cloudflare` | the nearest Cloudflare data centre | Cloudflare's own. This is the network almost all of your internet traffic crosses, so it is a different and often more relevant question |
+| `librespeed` | a community-run LibreSpeed server | open source, and self-hostable: `--server https://your-own-box/backend` tests against a machine you control, which is the only way to measure a specific vantage point |
+
+Netflix's **fast.com** is deliberately *not* supported. Its API sits behind
+Akamai bot protection that rejects non-browser clients with a 403, and
+working around that would mean impersonating a browser we are not. If they
+ever open it up, it drops in as a fourth provider.
+
+Comparing providers is often more informative than any single test:
+
+```
+$ spdng compare --providers ookla cloudflare
+
+           Ookla (speedtest.net)   Cloudflare
+───────────────────────────────────────────────────────────
+Server
+           Blue Stream Fiber Miami, FL
+
+           Cloudflare Nearest Cloudflare data centre
+Provider
+           ookla  5 km
+           cloudflare  -
+
+Download   224.75 Mbit/s           317.02 Mbit/s
+Upload     10.51 Mbit/s            7.42 Mbit/s
+Ping       47.93 ms                57.97 ms
+Jitter     3.29 ms                 6.34 ms
+Loss       0.0 %                   0.0 %
+
+           vs first column
+Download   ~same                   ▲41%
+Upload     ~same                   ▼29%
+Ping       ~same                   ▲21%
+```
+
+Cloudflare is 41% faster than Ookla from the same machine at the same
+moment. That is a routing fact you would never see from a single-provider
+test, and it is usually the interesting one.
 
 ---
 
@@ -128,18 +183,23 @@ cd spdng && pip install -e .
 ```bash
 spdng speedtest                  # test against the nearest server
 spdng speedtest --trace          # ...and trace the path to it (mtr-style)
-spdng speedtest --server spectrum --trace
-spdng speedtest --json           # machine-readable output
+spdng speedtest --provider cf    # measure to Cloudflare instead
+spdng compare                    # test all three providers, side by side
+spdng repeat --count 5           # run the same test 5 times, show the spread
+spdng watch --interval 30        # keep testing, show a live trend
+spdng history                    # past measurements and the trend
 spdng servers                    # list candidate servers, nearest first
 spdng trace 1.1.1.1              # mtr-style traceroute on its own
 spdng doctor                     # what does this environment support?
+spdng moo                        # moo
 ```
 
 ### Options
 
 | flag | meaning |
 |---|---|
-| `--server` | pick a server by host, name, or sponsor |
+| `--provider` | `ookla`, `cloudflare`, or `librespeed` |
+| `--server` | pick a server by host, name, sponsor, or a full URL for your own instance |
 | `--duration` | seconds per direction (default 10) |
 | `--threads` | parallel connections (default 4) |
 | `--max-distance` | only consider servers within N km |
@@ -149,6 +209,74 @@ spdng doctor                     # what does this environment support?
 | `--json` | machine-readable output |
 | `--no-upload` / `--no-download` | skip a direction |
 | `--no-latency` | skip the standalone latency pre-check |
+| `--no-fun` | no grades, no speedometer, no wisecracks |
+| `--no-history` | do not record this result |
+| `--color` / `--no-color` | force colour on or off |
+| `--theme` | `default`, `mono`, `solarized`, `matrix`, `vaporwave`, `amber` |
+
+### Colour
+
+`spdng` honours the [NO_COLOR](https://no-color.org) convention, which takes
+precedence over `FORCE_COLOR`. It also honours `FORCE_COLOR` for people who
+pipe output and want it anyway, and detects non-terminals correctly.
+
+Colour is **never the only signal**. Every coloured value also carries its
+text, so the output reads identically in a monochrome terminal or in a log
+file. Colour is decoration, not information.
+
+### The fun bits
+
+An easter egg must never lie about a measurement, never slow the tool down,
+never be obscure for its own sake, and must be funny to someone who does not
+know it exists. Within those rules:
+
+- a **grade** (S+ down to F) with a plain-language description
+- an **ASCII speedometer**
+- short remarks that depend on the measured speed, so a 3 Mbit/s result
+  gets a different remark than a 300 Mbit/s one
+- `spdng moo`, the obligatory cow
+- **sparklines**, which are also the basis of the watch and history views
+
+`--no-fun` turns all of it off.
+
+### Live monitoring
+
+`spdng watch` re-runs the measurement on a timer and draws a live
+sparkline, because the useful question is rarely "how fast is my internet
+right now" but "why was it slow at 8pm":
+
+```
+$ spdng watch --interval 30
+  236.7 Mbit/s down   0.0 Mbit/s up  ping  46.3 ms  next in 11s  ctrl-c to stop
+  226.9 Mbit/s down   0.0 Mbit/s up  ping  49.0 ms    █▁ 226.9..236.7 Mbit/s
+  234.1 Mbit/s down   0.0 Mbit/s up  ping  51.6 ms    █▁▆ 226.9..236.7 Mbit/s
+  177.0 Mbit/s down   0.0 Mbit/s up  ping  47.9 ms    █▆▇▁ 177.0..236.7 Mbit/s
+
+4 samples
+  download: min 177.0  max 236.7  avg 218.7 Mbit/s
+  ping    : min 46.3  max 51.6  avg 48.7 ms
+  █▆▇▁ 177.0..236.7 Mbit/s
+  spread: 34% (somewhat variable)
+```
+
+### History
+
+Every result is recorded to a JSON-lines file under `XDG_DATA_HOME`
+(`~/.local/share/spdng/history.jsonl` by default). Plain text, local,
+nothing uploaded, `--clear` deletes it.
+
+```
+$ spdng history
+
+2 past measurements
+
+  2026-10-21 16:50  ookla          266.92 Mbit/s down    0.00 Mbit/s up  ping   45.6 ms
+  2026-10-21 16:50  cloudflare     276.67 Mbit/s down    0.00 Mbit/s up  ping   58.6 ms
+
+  range: 266.9 .. 276.7 Mbit/s (avg 271.8)
+  ▁█ 266.9..276.7 Mbit/s
+  trend: ▲ 3.7% vs the first half of the history
+```
 
 ### JSON output
 
@@ -166,6 +294,8 @@ $ spdng speedtest --trace --json
     "distance_km": 5.0,
     "latency_ms": 50.23
   },
+  "provider": "ookla",
+  "provider_label": "Ookla (speedtest.net)",
   "download_mbps": 237.45,
   "upload_mbps": 9.99,
   "latency": {
@@ -190,6 +320,8 @@ $ spdng speedtest --trace --json
   }
 }
 ```
+
+JSON output never contains ANSI escapes, so it is always safe to parse.
 
 ---
 
@@ -217,6 +349,10 @@ congestion begins. `spdng` names the hop.
 **Approximate measurements are marked.** A `~` in front of an RTT means we
 estimated it ourselves rather than reading it from the kernel. The final hop
 always carries a kernel-measured RTT and never has a tilde.
+
+**One speed test is noisy.** `spdng repeat` runs the same test N times and
+reports the spread, distinguishing steady (<10%), somewhat variable, and
+very variable.
 
 ### Traceroute backends
 
@@ -248,10 +384,12 @@ spdng doctor
   ping binary           : yes
     -> startup overhead: 1.9 ms (calibrated)
   traceroute method     : ping (via CAP_NET_RAW ping binary)
+  colour                : on  (theme: default)
 
   location lookup       : ok (28.076, -82.485)
-  server list           : ok (5 servers)
-  nearest server        : speedtest03.bluestreamfiber.net... (5 km)
+  provider ookla       : ok (3 servers) speedtest03.bluestreamfiber.net... (5 km)
+  provider cloudflare  : ok (1 servers) speed.cloudflare.com:443
+  provider librespeed  : ok (3 servers) ams.speedtest.clouvider.net (656 km)
 ```
 
 ---
@@ -271,7 +409,11 @@ Live network tests are opt-in:
 SPDNG_LIVE=1 .venv/bin/python -m pytest -m live -q
 ```
 
----
+The test suite covers degenerate input, network failure, environment
+limits, output contracts, and the process itself. It is organised in four
+files: `test_spdng.py` for the core, `test_fun.py` for the extras,
+`test_edge_cases.py` for the things that actually go wrong, and
+`test_history.py` for the local history file.
 
 ## License
 
