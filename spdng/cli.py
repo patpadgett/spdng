@@ -11,7 +11,17 @@ import json
 import socket
 import sys
 
-from . import compare, measure, providers, render, servers, style, traceroute
+from . import (
+    compare,
+    fun,
+    measure,
+    providers,
+    render,
+    servers,
+    style,
+    traceroute,
+    watch,
+)
 
 __version__ = "0.2.0"
 
@@ -132,7 +142,11 @@ def _trace_notes(trace) -> list[str]:
 
 def cmd_speedtest(args) -> int:
     _apply_style(args)
-    provider = providers.get_provider(args.provider)
+    try:
+        provider = providers.get_provider(args.provider)
+    except providers.ProviderError as exc:
+        print(f"spdng: {exc}", file=sys.stderr)
+        return 2
     server, err = _pick_server(provider, args)
     if err:
         print(f"spdng: {err}", file=sys.stderr)
@@ -155,7 +169,7 @@ def cmd_speedtest(args) -> int:
         return 0
 
     print()
-    print(render.render_result(result))
+    print(render.render_result(result, fun=not args.no_fun))
     if trace is not None:
         print()
         print(render.render_trace(trace))
@@ -221,7 +235,11 @@ def cmd_compare(args) -> int:
 def cmd_repeat(args) -> int:
     """Run the same test several times to see the spread."""
     _apply_style(args)
-    provider = providers.get_provider(args.provider)
+    try:
+        provider = providers.get_provider(args.provider)
+    except providers.ProviderError as exc:
+        print(f"spdng: {exc}", file=sys.stderr)
+        return 2
     server, err = _pick_server(provider, args)
     if err:
         print(f"spdng: {err}", file=sys.stderr)
@@ -247,6 +265,10 @@ def cmd_servers(args) -> int:
     _apply_style(args)
     try:
         provider = providers.get_provider(args.provider)
+    except providers.ProviderError as exc:
+        print(f"spdng: {exc}", file=sys.stderr)
+        return 2
+    try:
         lat, lon, attrs = servers.get_client_location(ua=USER_AGENT)
     except Exception as exc:  # noqa: BLE001
         print(f"spdng: could not determine location: {exc}", file=sys.stderr)
@@ -361,6 +383,45 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+def cmd_watch(args) -> int:
+    """Re-run the test on a timer and watch it move."""
+    _apply_style(args)
+    try:
+        provider = providers.get_provider(args.provider)
+    except providers.ProviderError as exc:
+        print(f"spdng: {exc}", file=sys.stderr)
+        return 2
+    server, err = _pick_server(provider, args)
+    if err:
+        print(f"spdng: {err}", file=sys.stderr)
+        return 2
+
+    def run_once():
+        result, _ = _run_one(provider, server, args, do_trace=False)
+        return result
+
+    results = watch.watch(run_once, interval=args.interval,
+                           duration=args.watch_duration)
+    if not results:
+        return 1
+    if args.json:
+        print(json.dumps([r.to_dict() for r in results], indent=2))
+        return 0
+    print()
+    print(watch.render_watch_summary(results))
+    return 0
+
+
+def cmd_moo(args) -> int:
+    """The obligatory easter egg."""
+    _apply_style(args)
+    text = " ".join(args.text) if args.text else (
+        f"{fun.time_of_day_greeting()}, "
+        f"{'it is friday' if fun.it_is_friday() else 'have a nice day'}")
+    print(fun.cowsay(text))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="spdng",
@@ -374,6 +435,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="force colour output even when piped")
     p.add_argument("--theme", choices=sorted(style.THEMES), default="default",
                    help="colour theme")
+    p.add_argument("--no-fun", action="store_true",
+                   help="no grades, no speedometer, no wisecracks")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):
@@ -439,6 +502,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("doctor", help="check what this environment supports")
     sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("watch", help="re-test on a timer and show a trend")
+    add_common(sp)
+    sp.add_argument("--interval", type=float, default=30.0,
+                    help="seconds between tests")
+    sp.add_argument("--watch-duration", type=float, default=0.0,
+                    help="stop after this many seconds (0 = until ctrl-c)")
+    sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("moo", help="moo")
+    sp.add_argument("text", nargs="*", help="what the cow should say")
+    sp.set_defaults(func=cmd_moo)
 
     return p
 

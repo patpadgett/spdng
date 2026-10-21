@@ -38,8 +38,15 @@ def format_speed(download_mbps: float, upload_mbps: float) -> str:
             f"Upload: {c(f'{upload_mbps:.2f}', 'bold')} Mbit/s")
 
 
-def render_result(result: SpeedTestResult, show_server: bool = True) -> str:
-    """Render a speed test the way speedtest-cli does, but correctly."""
+def render_result(result: SpeedTestResult, show_server: bool = True,
+                  fun: bool = True) -> str:
+    """Render a speed test the way speedtest-cli does, but correctly.
+
+    The optional extras (grade, speedometer, quip) are decoration on top of
+    a measurement. The measurement comes first and is never altered by them.
+    """
+    from . import fun as funmod
+
     out: list[str] = []
     srv = result.server
     if show_server and srv is not None:
@@ -53,6 +60,13 @@ def render_result(result: SpeedTestResult, show_server: bool = True) -> str:
         out.append("Ping: " + c('unavailable', 'bold') +
                    "   (latency probe failed; not reporting a placeholder)")
     out.append(format_speed(result.download_mbps, result.upload_mbps))
+
+    if fun:
+        out.append("")
+        out.append(f"  {funmod.render_speedometer(result.download_mbps)}")
+        out.append(f"  Grade: {funmod.render_grade(result.download_mbps)}"
+                   f"   {c(funmod.quip_for(result.download_mbps), 'dim')}")
+
     if result.share_url:
         out.append(f"Share: {result.share_url}")
     for err in result.errors:
@@ -166,6 +180,9 @@ def render_loss_summary(trace: TraceResult) -> str:
 
 def render_server_table(servers: Iterable, limit: int = 10) -> str:
     """Render the candidate server list, nearest first."""
+    servers = list(servers)
+    if not servers:
+        return "no servers found"
     out: list[str] = []
     out.append(c(f"{'#':>3}  {'Distance':>9}  {'Latency':>9}  "
                  f"{'Spons':<24} Location", "bold"))

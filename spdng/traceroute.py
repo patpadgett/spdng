@@ -397,7 +397,7 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
 
     ping = shutil.which("ping")
     if not ping:
-        return None, [], 0
+        return None, [], 0, False
     wait = max(1, int(timeout))
     overhead = _ping_startup_overhead()
 
