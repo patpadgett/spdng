@@ -10,10 +10,12 @@ import argparse
 import json
 import socket
 import sys
+import time
 
 from . import (
     compare,
     fun,
+    history,
     measure,
     providers,
     render,
@@ -158,6 +160,9 @@ def cmd_speedtest(args) -> int:
               f"{server.distance_km:.0f} km away", file=sys.stderr)
 
     result, trace = _run_one(provider, server, args, do_trace=args.trace)
+
+    if not args.no_history:
+        history.append(history.entry_from_result(result, provider.id))
 
     if args.json:
         payload = result.to_dict()
@@ -412,6 +417,63 @@ def cmd_watch(args) -> int:
     return 0
 
 
+def cmd_history(args) -> int:
+    """Show past measurements and the trend."""
+    _apply_style(args)
+    entries = history.load(limit=args.limit)
+
+    if args.clear:
+        history.clear()
+        print("history cleared")
+        return 0
+
+    if not entries:
+        print("no history yet; run a speedtest first")
+        return 0
+
+    if args.json:
+        print(json.dumps({
+            "entries": [e.to_dict() for e in entries],
+            "trend": _trend_json(entries),
+        }, indent=2))
+        return 0
+
+    print()
+    print(style.paint(f"{len(entries)} past measurements", "heading"))
+    print()
+    for e in entries[-args.show:]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.timestamp))
+        ping = f"{e.ping_ms:6.1f} ms" if e.ping_ms is not None else "     n/a"
+        print(f"  {when}  {e.provider:<12} "
+              f"{style.paint(f'{e.download_mbps:>8.2f}', 'good')} Mbit/s down  "
+              f"{style.paint(f'{e.upload_mbps:>6.2f}', 'ok')} Mbit/s up  "
+              f"ping {ping}")
+
+    t = history.trend(entries)
+    print()
+    downloads = [e.download_mbps for e in entries]
+    print(f"  {style.paint('range', 'dim')}: "
+          f"{t['download_min']:.1f} .. {t['download_max']:.1f} Mbit/s "
+          f"(avg {t['download_avg']:.1f})")
+    print(f"  {fun.sparkline_history(downloads)}")
+    if "change_pct" in t:
+        change = t["change_pct"]
+        role = "good" if change >= 0 else "bad"
+        arrow = "▲" if change >= 0 else "▼"
+        print(f"  {style.paint('trend', 'dim')}: {arrow} {abs(change):.1f}% "
+              f"{style.paint('vs the first half of the history', role)}")
+    print()
+    print(style.paint(f"  history file: {history.history_path()}", "muted"))
+    print()
+    return 0
+
+
+def _trend_json(entries) -> dict:
+    t = history.trend(entries)
+    return {k: (v.to_dict() if hasattr(v, "to_dict") else v)
+            for k, v in t.items()}
+
+
 def cmd_moo(args) -> int:
     """The obligatory easter egg."""
     _apply_style(args)
@@ -437,6 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="colour theme")
     p.add_argument("--no-fun", action="store_true",
                    help="no grades, no speedometer, no wisecracks")
+    p.add_argument("--no-history", action="store_true",
+                   help="do not record this result to the local history")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):
@@ -510,6 +574,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--watch-duration", type=float, default=0.0,
                     help="stop after this many seconds (0 = until ctrl-c)")
     sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("history", help="show past measurements and the trend")
+    sp.add_argument("--limit", type=int, default=200,
+                    help="how many history entries to load")
+    sp.add_argument("--show", type=int, default=10,
+                    help="how many to print")
+    sp.add_argument("--clear", action="store_true",
+                    help="delete the history file and exit")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_history)
 
     sp = sub.add_parser("moo", help="moo")
     sp.add_argument("text", nargs="*", help="what the cow should say")
