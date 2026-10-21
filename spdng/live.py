@@ -141,20 +141,22 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
 
             view.render(screen)
 
-            # Handle keys
-            code = screen.getch(200 if paused else 200)
+            # Handle keys. We read with a short timeout so the loop stays
+            # responsive, and we check BEFORE the next probe round so a
+            # keypress is never swallowed by a slow round.
+            code = screen.getch(200)
             key = key_name(code)
             if key in ("Q", "ESC"):
                 should_quit = True
             elif key == "S":
-                _save_csv(view, save_dir)
-                view.set_status("running", "saved CSV")
+                path = _save_csv(view, save_dir)
+                view.set_status("running", f"saved {path}")
             elif key == "J":
-                _save_json(view, save_dir)
-                view.set_status("running", "saved JSON")
+                path = _save_json(view, save_dir)
+                view.set_status("running", f"saved {path}")
             elif key == "R":
-                _save_report(view, save_dir)
-                view.set_status("running", "saved report")
+                path = _save_report(view, save_dir)
+                view.set_status("running", f"saved {path}")
             elif key == "SPACE":
                 paused = not paused
                 view.set_status("paused" if paused else "running")
