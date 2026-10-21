@@ -189,6 +189,7 @@ spdng repeat --count 5           # run the same test 5 times, show the spread
 spdng watch --interval 30        # keep testing, show a live trend
 spdng history                    # past measurements and the trend
 spdng servers                    # list candidate servers, nearest first
+spdng live 1.1.1.1               # live mtr-style trace, updating in place
 spdng trace 1.1.1.1              # mtr-style traceroute on its own
 spdng doctor                     # what does this environment support?
 spdng moo                        # moo
@@ -213,6 +214,100 @@ spdng moo                        # moo
 | `--no-history` | do not record this result |
 | `--color` / `--no-color` | force colour on or off |
 | `--theme` | `default`, `mono`, `solarized`, `matrix`, `vaporwave`, `amber` |
+
+### Boxed output
+
+Tables are drawn inside an ASCII frame, with the title in the top border:
+
+```
++- spdng result ----------------------------------------------------+
+| Metric   |                       Value | Detail                   |
++-------------------------------------------------------------------+
+| Server   | Blue Stream Fiber Miami, FL | [US] 5 km                |
+| Provider |                       ookla |                          |
+| Ping     |                    45.46 ms | jitter 7.43 ms   loss 0% |
+| Download |               223.52 Mbit/s | 10.6 MB in 0.4s          |
+| Upload   |                 0.00 Mbit/s | 0.0 MB in 0.0s           |
+| Grade    |                           A | very good                |
++-------------------------------------------------------------------+
+```
+
+Columns line up exactly, and they line up with colour on too. That last part
+is not automatic: `len()` on a coloured string counts the ANSI escape
+sequences, so a coloured cell measures nine characters wider than a plain
+one and every column after it drifts. `spdng` measures the *visible* width
+instead, and there is a test that asserts every line of every table has the
+same visible width, with and without colour.
+
+The default frame is plain ASCII so it renders identically in a log file or
+a CI transcript. Unicode, rounded and double styles are available in
+`spdng/table.py`.
+
+### The live mtr view
+
+`spdng live <target>` is the mtr loop: a round of probes to every hop in
+parallel, a redraw, and repeat.
+
+```
+ spdng live trace -> 1.1.1.1   round 4   15s   running
+
+  Hop   Loss%  Snt      Last       Avg      Best     Worst    StDev History                Host
+ -------------------------------------------------------------------------------------------
+    1    0.0%    5    2.31ms    2.11ms    1.30ms    3.51ms   0.86ms .....                  192.168.1.1
+    2    0.0%    5    1.32ms    3.30ms    1.32ms    5.06ms   1.71ms .....                  72.187.94.43
+    3   80.0%    5   12.35ms   12.35ms   12.35ms   12.35ms      --- ooo.o                  72.187.94.43
+```
+
+The history column uses the mtr convention:
+
+| character | meaning |
+|---|---|
+| `.` | the probe came back |
+| `o` | the probe timed out |
+| `O` | the probe was refused |
+| `X` | the probe hit an error |
+
+A column of `.........o..` says the link is fine with an occasional blip.
+A column of `oooOOXXXXX` says the hop is down, and the view says so
+explicitly rather than making you read rows of `*`.
+
+### Hotkeys
+
+Both the live trace and the watch view respond to keys:
+
+| key | action |
+|---|---|
+| `q` | quit |
+| `s` | save the current data as CSV |
+| `j` | save it as JSON |
+| `r` | save a human-readable report |
+| `space` | pause and resume |
+| `+` / `-` | change the interval between rounds |
+
+Reports go to `~/.local/share/spdng/reports` by default, or wherever
+`--save-dir` says. `spdng speedtest` also takes `--csv` for stdout,
+`--save PATH` for a file, and `--save-dir` for the directory.
+
+### The watch graph
+
+`spdng watch` draws a live bar graph per metric, scaled against the best
+sample in the session, plus a vertical chart of download over time. Ping is
+drawn inverted, so a tall bar always means a problem rather than always
+meaning a good number.
+
+```
+  Download
+    peak         256.0 Mbit/s   last     190.0   avg     175.0
+    ████████████████████████████████████████████████░░░░░░░░░░░░░░░░   190.0 Mbit/s
+
+  Download over time
+            █         ▄       256.0
+            █   █   █ █       224.0
+  █ █      ▄█   █▄█ █▄█  ▄    192.0
+  █ ██  █ ███▄▄ ███████▄ █    160.0
+  █▄██▄▄█▄█████▄██████████    128.0
+  ████████████████████████     96.0
+```
 
 ### Colour
 
@@ -410,10 +505,16 @@ SPDNG_LIVE=1 .venv/bin/python -m pytest -m live -q
 ```
 
 The test suite covers degenerate input, network failure, environment
-limits, output contracts, and the process itself. It is organised in four
+limits, output contracts, and the process itself. It is organised in five
 files: `test_spdng.py` for the core, `test_fun.py` for the extras,
-`test_edge_cases.py` for the things that actually go wrong, and
-`test_history.py` for the local history file.
+`test_edge_cases.py` for the things that actually go wrong,
+`test_history.py` for the local history file, and `test_ui.py` for the
+tables and the live view.
+
+`test_ui.py` has the alignment tests, which are the ones worth keeping:
+every line of every table must have the same visible width, with and
+without colour, in every box style. That is the test that would have
+caught the original misalignment.
 
 ## License
 
