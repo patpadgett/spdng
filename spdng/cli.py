@@ -14,8 +14,10 @@ import time
 
 from . import (
     compare,
+    frames,
     fun,
     history,
+    live,
     measure,
     providers,
     render,
@@ -173,15 +175,53 @@ def cmd_speedtest(args) -> int:
         print(json.dumps(payload, indent=2))
         return 0
 
+    if args.csv:
+        sys.stdout.write(frames.result_to_csv(result))
+        return 0
+
+    if args.save:
+        path = _write_report(result, args, provider)
+        if args.verbose:
+            print(f"saved {path}", file=sys.stderr)
+
     print()
-    print(render.render_result(result, fun=not args.no_fun))
+    print(frames.result_table(result, fun_on=not args.no_fun))
     if trace is not None:
         print()
-        print(render.render_trace(trace))
+        print(frames.trace_table(trace))
         print()
         print(render.render_loss_summary(trace))
     print()
     return 0
+
+
+def _write_report(result, args, provider) -> str:
+    """Write a result to a file, in the format the extension asks for."""
+    import os
+    if args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
+        base = args.save_dir
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME")
+        root = xdg if xdg else os.path.join(os.path.expanduser("~"),
+                                           ".local", "share")
+        base = os.path.join(root, "spdng", "reports")
+        os.makedirs(base, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    ext = os.path.splitext(args.save)[1].lstrip(".") or "txt"
+    path = os.path.join(base, f"result-{stamp}.{ext}")
+    if ext == "csv":
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(frames.result_to_csv(result))
+    elif ext == "json":
+        payload = result.to_dict()
+        payload["provider"] = provider.id
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+    else:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(frames.result_table(result, fun_on=not args.no_fun) + "\n")
+    return path
 
 
 def cmd_compare(args) -> int:
@@ -296,7 +336,7 @@ def cmd_servers(args) -> int:
     print(f"Your location: {lat:.4f}, {lon:.4f} "
           f"({attrs.get('isp', 'unknown ISP')})")
     print()
-    print(render.render_server_table(ranked, limit=args.limit))
+    print(frames.server_table(ranked, limit=args.limit))
     print()
     return 0
 
@@ -331,7 +371,7 @@ def cmd_trace(args) -> int:
         return 0
 
     print()
-    print(render.render_trace(trace))
+    print(frames.trace_table(trace))
     print()
     print(render.render_loss_summary(trace))
     print()
@@ -405,16 +445,97 @@ def cmd_watch(args) -> int:
         result, _ = _run_one(provider, server, args, do_trace=False)
         return result
 
-    results = watch.watch(run_once, interval=args.interval,
-                           duration=args.watch_duration)
-    if not results:
-        return 1
-    if args.json:
-        print(json.dumps([r.to_dict() for r in results], indent=2))
+    if args.plain:
+        results = watch.watch(run_once, interval=args.interval,
+                               duration=args.watch_duration)
+        if not results:
+            return 1
+        if args.json:
+            print(json.dumps([r.to_dict() for r in results], indent=2))
+            return 0
+        print()
+        print(watch.render_watch_summary(results))
         return 0
+
+    return _watch_curses(run_once, provider, server, args)
+
+
+def _watch_curses(run_once, provider, server, args) -> int:
+    """The curses watch view, with a live bar graph and hotkeys."""
+    from .tui import Screen, key_name
+    from .watchview import WatchSample, WatchView, save_csv, save_json, save_report
+
+    view = WatchView(target=f"{provider.label} {server.name}")
+    interval = args.interval
+    paused = False
+    samples: list[WatchSample] = []
+    started = time.time()
+
+    with Screen("spdng watch") as screen:
+        while True:
+            if not paused:
+                result = run_once()
+                sample = WatchSample(
+                    timestamp=time.time(),
+                    download_mbps=result.download_mbps,
+                    upload_mbps=result.upload_mbps,
+                    ping_ms=result.latency.avg_ms,
+                    provider=provider.id,
+                    server=f"{server.sponsor} {server.name}",
+                )
+                samples.append(sample)
+                view.add(sample)
+                view.set_status("running")
+
+            view.render(screen)
+
+            code = screen.getch(200)
+            key = key_name(code)
+            if key in ("Q", "ESC"):
+                break
+            elif key == "S":
+                path = live._report_path(args.save_dir, "watch", "csv")
+                save_csv(samples, path)
+                view.set_status("running", f"saved {path}")
+            elif key == "J":
+                path = live._report_path(args.save_dir, "watch", "json")
+                save_json(samples, path)
+                view.set_status("running", f"saved {path}")
+            elif key == "R":
+                path = live._report_path(args.save_dir, "watch", "txt")
+                save_report(samples, path, view.target)
+                view.set_status("running", f"saved {path}")
+            elif key == "SPACE":
+                paused = not paused
+                view.set_status("paused" if paused else "running")
+            elif key == "+":
+                interval = max(2.0, interval - 1.0)
+                view.set_status("running", f"interval {interval:.0f}s")
+            elif key == "-":
+                interval = min(600.0, interval + 1.0)
+                view.set_status("running", f"interval {interval:.0f}s")
+
+            if args.watch_duration and (time.time() - started) >= args.watch_duration:
+                break
+            if not paused:
+                time.sleep(max(0.0, interval - args.duration * 2 - 3))
+
     print()
-    print(watch.render_watch_summary(results))
+    if samples:
+        print(render.render_watch_summary(
+            [r for r in [_result_from_sample(s) for s in samples]]))
     return 0
+
+
+def _result_from_sample(sample):
+    """Rebuild a minimal result from a watch sample, for the summary."""
+    r = measure.SpeedTestResult(server=None)
+    r.download_mbps = sample.download_mbps
+    r.upload_mbps = sample.upload_mbps
+    r.latency = measure.LatencyResult(
+        samples_ms=[sample.ping_ms] if sample.ping_ms else [], errors=0,
+        attempts=1)
+    return r
 
 
 def cmd_history(args) -> int:
@@ -474,6 +595,21 @@ def _trend_json(entries) -> dict:
             for k, v in t.items()}
 
 
+def cmd_live(args) -> int:
+    """The live mtr-style trace."""
+    _apply_style(args)
+    return live.run_live_trace(
+        args.target,
+        port=args.port or 33434,
+        max_hops=args.max_hops,
+        interval=args.interval,
+        rounds=args.rounds,
+        timeout=args.timeout,
+        method=args.method,
+        save_dir=args.save_dir,
+    )
+
+
 def cmd_moo(args) -> int:
     """The obligatory easter egg."""
     _apply_style(args)
@@ -524,6 +660,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--no-download", action="store_true")
         sp.add_argument("--no-latency", action="store_true",
                         help="skip the standalone latency pre-check")
+        sp.add_argument("--csv", action="store_true",
+                        help="write the result as CSV to stdout")
+        sp.add_argument("--save", metavar="PATH",
+                        help="save the result to a file (.txt, .csv, .json)")
+        sp.add_argument("--save-dir", default=None,
+                        help="default directory for saved reports")
         sp.add_argument("--trace", action="store_true",
                         help="also trace the path to the test server (mtr-style)")
         sp.add_argument("--trace-probes", type=int, default=3)
@@ -554,6 +696,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.set_defaults(func=cmd_servers)
 
+    sp = sub.add_parser("live", help="live mtr-style traceroute, updating in place")
+    sp.add_argument("target", nargs="?", default="1.1.1.1")
+    sp.add_argument("--port", type=int, default=None)
+    sp.add_argument("--max-hops", type=int, default=20)
+    sp.add_argument("--interval", type=float, default=1.0,
+                    help="seconds between rounds")
+    sp.add_argument("--rounds", type=int, default=0,
+                    help="stop after N rounds (0 = until you quit)")
+    sp.add_argument("--timeout", type=float, default=2.0)
+    sp.add_argument("--method", choices=["auto", "icmp", "udp"], default="auto")
+    sp.add_argument("--save-dir", default=None,
+                    help="where to save reports (default: the data dir)")
+    sp.set_defaults(func=cmd_live)
+
     sp = sub.add_parser("trace", help="mtr-style traceroute to a host")
     sp.add_argument("target")
     sp.add_argument("--port", type=int, default=None)
@@ -573,6 +729,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seconds between tests")
     sp.add_argument("--watch-duration", type=float, default=0.0,
                     help="stop after this many seconds (0 = until ctrl-c)")
+    sp.add_argument("--plain", action="store_true",
+                    help="plain text output instead of the curses view")
     sp.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser("history", help="show past measurements and the trend")
