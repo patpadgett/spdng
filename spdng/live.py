@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from . import traceroute
 from .tui import (
@@ -124,9 +123,27 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
         return probe_hop(ip, port, ttl, timeout, method)
 
     def probe_round():
-        """One round of probes to every hop, in parallel."""
-        with ThreadPoolExecutor(max_workers=max(1, max_hops)) as pool:
-            return list(pool.map(do_probe, range(1, max_hops + 1)))
+        """One round of probes to every hop, in parallel.
+
+        Plain threads, not a ThreadPoolExecutor. The executor's
+        shutdown handler takes a lock, and at interpreter exit that
+        lock can be held by a probe that is still running - so the
+        process hangs for a couple of seconds after you press "q".
+        Plain daemon threads are simply abandoned.
+        """
+        results: list = [None] * max_hops
+        threads = []
+
+        def run(index: int):
+            results[index] = do_probe(index + 1)
+
+        for index in range(max_hops):
+            thread = threading.Thread(target=run, args=(index,), daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        return [r for r in results if r is not None]
 
     def worker():
         while not stop.is_set():
