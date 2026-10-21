@@ -11,69 +11,102 @@ import json
 import socket
 import sys
 
-from . import measure, render, servers, traceroute
+from . import compare, measure, providers, render, servers, style, traceroute
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 USER_AGENT = measure.DEFAULT_UA
 
 
-def _resolve_server(args) -> tuple[servers.Server | None, str | None]:
+def _apply_style(args) -> None:
+    """Set up colour and theme from the parsed arguments."""
+    if getattr(args, "no_color", False):
+        style.set_color(False)
+    elif getattr(args, "color", False):
+        style.set_color(True)
+    if getattr(args, "theme", None):
+        style.set_theme(args.theme)
+
+
+def _set_origin(provider, args) -> None:
+    """Tell the provider where the user is, so it can rank by distance.
+
+    Only some providers need it (Ookla and Cloudflare know your location
+    server-side; LibreSpeed's public list is just a flat list), but it
+    costs one lookup and makes the ranking consistent.
+    """
+    setter = getattr(provider, "set_origin", None)
+    if setter is None:
+        return
+    try:
+        lat, lon, _attrs = servers.get_client_location(ua=USER_AGENT)
+    except Exception:  # noqa: BLE001
+        return
+    setter(lat, lon)
+
+
+def _pick_server(provider, args) -> tuple[servers.Server | None, str | None]:
     """Pick the server to test against."""
-    all_servers = servers.fetch_servers(limit=args.limit * 3, ua=USER_AGENT)
-    if not all_servers:
-        return None, "server list was empty"
+    _set_origin(provider, args)
+    candidates = provider.list_servers(limit=max(10, args.limit))
+
+    if not candidates:
+        return None, f"{provider.label} returned no servers"
 
     if args.server:
         needle = args.server.lower()
-        for s in all_servers:
-            if needle in s.host.lower() or needle in s.name.lower() \
-                    or needle in s.sponsor.lower():
+        for s in candidates:
+            if (needle in s.host.lower() or needle in s.name.lower()
+                    or needle in s.sponsor.lower()):
                 return s, None
+        # A URL means "use this exact server", which is how you point at a
+        # LibreSpeed instance you run yourself.
+        if args.server.lower().startswith(("http://", "https://")):
+            url = args.server.rstrip("/")
+            host = url.split("//", 1)[-1].split("/")[0]
+            return servers.Server(
+                id="custom", host=host, sponsor="Custom", name=url,
+                country="", cc="", lat=0.0, lon=0.0, distance_km=0.0,
+                url=url, provider=provider.id,
+            ), None
         return None, f"no server matched {args.server!r}"
 
-    ranked = servers.rank_servers(all_servers, max_distance_km=args.max_distance)
-    if not ranked:
-        return None, (f"no servers within {args.max_distance} km; "
-                      f"raise --max-distance")
-    return ranked[0], None
+    if args.max_distance > 0:
+        candidates = [s for s in candidates if s.distance_km <= args.max_distance]
+        if not candidates:
+            return None, (f"no servers within {args.max_distance} km; "
+                          f"raise --max-distance")
+    return candidates[0], None
 
 
-def cmd_speedtest(args) -> int:
-    server, err = _resolve_server(args)
-    if err:
-        print(f"spdng: {err}", file=sys.stderr)
-        return 2
+def _run_one(provider, server, args, *, do_trace: bool):
+    """Run a full measurement against one server with one provider."""
+    result = measure.SpeedTestResult(server=server)
+    result.provider = provider.id
+    result.provider_label = provider.label
 
-    if args.verbose:
-        print(f"Selected {server.host} ({server.name}) "
-              f"{server.distance_km:.0f} km away", file=sys.stderr)
+    result.latency = provider.measure_latency(
+        server, count=args.latency_samples)
+    server.latency_ms = result.latency.avg_ms
+    server.jitter_ms = result.latency.jitter_ms
 
-    # Latency first, so we can report a real number before the long test.
-    if not args.no_latency:
-        lat = measure.measure_latency(server.base, count=args.latency_samples,
-                                      ua=USER_AGENT)
-        server.latency_ms = lat.avg_ms
-        server.jitter_ms = lat.jitter_ms
-        if args.verbose:
-            print(f"Latency: {lat.avg_ms} ms "
-                  f"(min {lat.min_ms}, max {lat.max_ms}, "
-                  f"loss {lat.loss_pct:.0f}%)", file=sys.stderr)
+    if result.latency.avg_ms is None:
+        result.errors.append(
+            "latency probe failed against every server; "
+            "the server may require a browser session")
 
-    result = measure.run_speedtest(
-        server,
-        duration=args.duration,
-        threads=args.threads,
-        latency_samples=args.latency_samples,
-        do_upload=not args.no_upload,
-        do_download=not args.no_download,
-        ua=USER_AGENT,
-    )
+    if not args.no_download:
+        result.download_detail = provider.measure_download(
+            server, duration=args.duration, threads=args.threads)
+        result.download_mbps = result.download_detail.mbps
 
-    if args.trace:
-        # Trace to the resolved IP, not the hostname: ping would apply
-        # reverse DNS to the responder and we would lose the comparison
-        # against the target address.
+    if not args.no_upload:
+        result.upload_detail = provider.measure_upload(
+            server, duration=args.duration, threads=max(1, args.threads // 2))
+        result.upload_mbps = result.upload_detail.mbps
+
+    trace = None
+    if do_trace:
         host = server.host.split(":")[0]
         port = int(server.host.split(":")[1]) if ":" in server.host else 8080
         try:
@@ -85,22 +118,7 @@ def cmd_speedtest(args) -> int:
             probes=args.trace_probes, timeout=args.trace_timeout)
         result.errors.extend(_trace_notes(trace))
 
-    if args.json:
-        payload = result.to_dict()
-        if args.trace:
-            payload["trace"] = trace.to_dict()
-        print(json.dumps(payload, indent=2))
-        return 0
-
-    print()
-    print(render.render_result(result))
-    if args.trace:
-        print()
-        print(render.render_trace(trace))
-        print()
-        print(render.render_loss_summary(trace))
-    print()
-    return 0
+    return result, trace
 
 
 def _trace_notes(trace) -> list[str]:
@@ -112,24 +130,142 @@ def _trace_notes(trace) -> list[str]:
     return notes
 
 
+def cmd_speedtest(args) -> int:
+    _apply_style(args)
+    provider = providers.get_provider(args.provider)
+    server, err = _pick_server(provider, args)
+    if err:
+        print(f"spdng: {err}", file=sys.stderr)
+        return 2
+
+    if args.verbose:
+        print(f"Provider: {provider.describe()}", file=sys.stderr)
+        print(f"Selected {server.host} ({server.name}) "
+              f"{server.distance_km:.0f} km away", file=sys.stderr)
+
+    result, trace = _run_one(provider, server, args, do_trace=args.trace)
+
+    if args.json:
+        payload = result.to_dict()
+        payload["provider"] = provider.id
+        payload["provider_label"] = provider.label
+        if trace is not None:
+            payload["trace"] = trace.to_dict()
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print()
+    print(render.render_result(result))
+    if trace is not None:
+        print()
+        print(render.render_trace(trace))
+        print()
+        print(render.render_loss_summary(trace))
+    print()
+    return 0
+
+
+def cmd_compare(args) -> int:
+    """Run the same test against several providers and line them up."""
+    _apply_style(args)
+    results = []
+    titles = []
+    traces = {}
+
+    for name in args.providers:
+        try:
+            provider = providers.get_provider(name)
+        except providers.ProviderError as exc:
+            print(f"spdng: {exc}", file=sys.stderr)
+            return 2
+        server, err = _pick_server(provider, args)
+        if err:
+            print(f"spdng: {provider.label}: {err}", file=sys.stderr)
+            results.append(None)
+            titles.append(provider.label)
+            continue
+        if args.verbose:
+            print(f"Testing {provider.label} -> {server.host} "
+                  f"({server.name})", file=sys.stderr)
+        result, trace = _run_one(provider, server, args, do_trace=args.trace)
+        results.append(result)
+        titles.append(provider.label)
+        if trace is not None:
+            traces[provider.id] = trace
+
+    good = [r for r in results if r is not None]
+    if not good:
+        print("spdng: every provider failed", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = {
+            "results": [r.to_dict() for r in good],
+            "providers": titles,
+        }
+        if traces:
+            payload["traces"] = {k: v.to_dict() for k, v in traces.items()}
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print()
+    print(compare.render_comparison(good, titles))
+    print()
+    for pid, trace in traces.items():
+        print(style.paint(f"Path to {pid}", "heading"))
+        print(render.render_trace(trace))
+        print()
+    return 0
+
+
+def cmd_repeat(args) -> int:
+    """Run the same test several times to see the spread."""
+    _apply_style(args)
+    provider = providers.get_provider(args.provider)
+    server, err = _pick_server(provider, args)
+    if err:
+        print(f"spdng: {err}", file=sys.stderr)
+        return 2
+
+    runs = []
+    for i in range(args.count):
+        if args.verbose:
+            print(f"Run {i + 1} of {args.count}...", file=sys.stderr)
+        result, _ = _run_one(provider, server, args, do_trace=False)
+        runs.append(result)
+
+    if args.json:
+        print(json.dumps([r.to_dict() for r in runs], indent=2))
+        return 0
+
+    print()
+    print(compare.render_repeat_comparison(runs))
+    return 0
+
+
 def cmd_servers(args) -> int:
+    _apply_style(args)
     try:
+        provider = providers.get_provider(args.provider)
         lat, lon, attrs = servers.get_client_location(ua=USER_AGENT)
     except Exception as exc:  # noqa: BLE001
         print(f"spdng: could not determine location: {exc}", file=sys.stderr)
         lat = lon = 0.0
         attrs = {}
 
-    all_servers = servers.fetch_servers(limit=args.limit, ua=USER_AGENT)
-    ranked = servers.rank_servers(all_servers, max_distance_km=args.max_distance)
+    ranked = provider.list_servers(limit=args.limit)
 
     if args.json:
         print(json.dumps({
+            "provider": provider.id,
+            "provider_label": provider.label,
+            "infrastructure": provider.infrastructure,
             "client": attrs,
             "servers": [s.to_dict() for s in ranked],
         }, indent=2))
         return 0
 
+    print(f"Provider: {style.paint(provider.describe(), 'accent')}")
     print(f"Your location: {lat:.4f}, {lon:.4f} "
           f"({attrs.get('isp', 'unknown ISP')})")
     print()
@@ -139,6 +275,7 @@ def cmd_servers(args) -> int:
 
 
 def cmd_trace(args) -> int:
+    _apply_style(args)
     host = args.target
     try:
         ip = socket.gethostbyname(host)
@@ -150,8 +287,8 @@ def cmd_trace(args) -> int:
     if port is None:
         for proto in ("https", "http"):
             try:
-                with socket.create_connection((ip, 443 if proto == "https" else 80),
-                                              timeout=5):
+                with socket.create_connection(
+                        (ip, 443 if proto == "https" else 80), timeout=5):
                     port = 443 if proto == "https" else 80
                     break
             except OSError:
@@ -176,13 +313,14 @@ def cmd_trace(args) -> int:
 
 def cmd_doctor(args) -> int:
     """Report what this environment can and cannot do."""
+    _apply_style(args)
     print("spdng doctor")
     print("=" * 60)
     raw = traceroute.has_raw_icmp()
     unpriv = traceroute.has_unprivileged_icmp()
+    rng = traceroute.unprivileged_icmp_range()
     print(f"  raw ICMP sockets      : {'yes' if raw else 'no'}")
     print(f"  unprivileged ICMP     : {'yes' if unpriv else 'no'}")
-    rng = traceroute.unprivileged_icmp_range()
     print(f"  ping_group_range      : {rng if rng else 'unknown'}")
     if rng and rng[0] > rng[1]:
         print("    -> range is empty, unprivileged ICMP is disabled")
@@ -200,21 +338,25 @@ def cmd_doctor(args) -> int:
     else:
         method = "udp (IP_RECVERR)"
     print(f"  traceroute method     : {method}")
+    print(f"  colour                : "
+          f"{'on' if style.color_enabled() else 'off'}"
+          f"  (theme: {style.theme().name})")
     print()
     try:
         lat, lon, attrs = servers.get_client_location(ua=USER_AGENT)
         print(f"  location lookup       : ok ({lat:.3f}, {lon:.3f})")
     except Exception as exc:  # noqa: BLE001
         print(f"  location lookup       : FAILED ({exc})")
-    try:
-        srv = servers.fetch_servers(limit=5, ua=USER_AGENT)
-        print(f"  server list           : ok ({len(srv)} servers)")
-        if srv:
-            best = servers.rank_servers(srv)[0]
-            print(f"  nearest server        : {best.host} "
-                  f"({best.distance_km:.0f} km)")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  server list           : FAILED ({exc})")
+
+    for p in providers.all_providers():
+        try:
+            srv = p.list_servers(limit=3)
+            nearest = srv[0] if srv else None
+            detail = (f"{nearest.host} ({nearest.distance_km:.0f} km)"
+                      if nearest else "none")
+            print(f"  provider {p.id:<12}: ok ({len(srv)} servers) {detail}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  provider {p.id:<12}: FAILED ({exc})")
     print()
     return 0
 
@@ -226,6 +368,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version",
                    version=f"spdng {__version__}")
+    p.add_argument("--no-color", action="store_true",
+                   help="disable colour output (also honours NO_COLOR)")
+    p.add_argument("--color", action="store_true",
+                   help="force colour output even when piped")
+    p.add_argument("--theme", choices=sorted(style.THEMES), default="default",
+                   help="colour theme")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):
@@ -235,26 +383,45 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how many candidate servers to fetch")
         sp.add_argument("--max-distance", type=float, default=0.0,
                         help="only consider servers within N km (0 = no limit)")
+        sp.add_argument("--server", help="pick a server by host, name, sponsor, "
+                                         "or a full URL for your own instance")
+        sp.add_argument("--provider", default="ookla",
+                        help="which network to test against "
+                             "(ookla, cloudflare, librespeed)")
+        sp.add_argument("--duration", type=float, default=10.0,
+                        help="seconds per direction")
+        sp.add_argument("--threads", type=int, default=4,
+                        help="parallel connections")
+        sp.add_argument("--latency-samples", type=int, default=5)
+        sp.add_argument("--no-upload", action="store_true")
+        sp.add_argument("--no-download", action="store_true")
+        sp.add_argument("--no-latency", action="store_true",
+                        help="skip the standalone latency pre-check")
+        sp.add_argument("--trace", action="store_true",
+                        help="also trace the path to the test server (mtr-style)")
+        sp.add_argument("--trace-probes", type=int, default=3)
+        sp.add_argument("--trace-timeout", type=float, default=2.0)
+        sp.add_argument("--max-hops", type=int, default=20)
+        sp.add_argument("-v", "--verbose", action="store_true")
 
     sp = sub.add_parser("speedtest", help="run a bandwidth test")
     add_common(sp)
-    sp.add_argument("--server", help="pick a server by host, name, or sponsor")
-    sp.add_argument("--duration", type=float, default=10.0,
-                    help="seconds per direction")
-    sp.add_argument("--threads", type=int, default=4,
-                    help="parallel connections")
-    sp.add_argument("--latency-samples", type=int, default=5)
-    sp.add_argument("--no-latency", action="store_true",
-                    help="skip the standalone latency pre-check")
-    sp.add_argument("--no-upload", action="store_true")
-    sp.add_argument("--no-download", action="store_true")
-    sp.add_argument("--trace", action="store_true",
-                    help="also trace the path to the test server (mtr-style)")
-    sp.add_argument("--trace-probes", type=int, default=3)
-    sp.add_argument("--trace-timeout", type=float, default=2.0)
-    sp.add_argument("--max-hops", type=int, default=20)
-    sp.add_argument("-v", "--verbose", action="store_true")
     sp.set_defaults(func=cmd_speedtest)
+
+    sp = sub.add_parser("compare",
+                         help="test against several providers and line them up")
+    add_common(sp)
+    sp.add_argument("--providers", nargs="+",
+                    default=["ookla", "cloudflare", "librespeed"],
+                    help="which providers to compare")
+    sp.set_defaults(func=cmd_compare)
+
+    sp = sub.add_parser("repeat",
+                         help="run the same test several times to see the spread")
+    add_common(sp)
+    sp.add_argument("--count", type=int, default=3,
+                    help="how many times to run the test")
+    sp.set_defaults(func=cmd_repeat)
 
     sp = sub.add_parser("servers", help="list candidate servers, nearest first")
     add_common(sp)
@@ -284,6 +451,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
+    except providers.ProviderError as exc:
+        print(f"spdng: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

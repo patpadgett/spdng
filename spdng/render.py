@@ -2,31 +2,30 @@
 from __future__ import annotations
 
 import shutil
-import sys
 from collections.abc import Iterable
 
+from . import style
 from .measure import SpeedTestResult
 from .traceroute import Hop, TraceResult
 
-_RESET = "\033[0m"
-_BOLD = "\033[1m"
-_DIM = "\033[2m"
-
-
-def _supports_color() -> bool:
-    if not sys.stdout.isatty():
-        return False
-    import os
-    return os.environ.get("TERM", "") not in ("", "dumb")
-
-
-_COLOR = _supports_color()
-
 
 def c(text: str, code: str) -> str:
-    if not _COLOR:
+    """Colour text by theme role.
+
+    A role name from style.CODES (like "green" or "bold") is resolved
+    through the active theme. A raw ANSI code still works, for the rare
+    case where we need a specific colour the theme does not name.
+    """
+    if code in style.CODES:
+        return style.paint(text, code)
+    if not style.color_enabled():
         return text
-    return f"{code}{text}{_RESET}"
+    return f"{code}{text}{style.RESET}"
+
+
+def themed(text: str, role: str) -> str:
+    """Colour text by theme role only."""
+    return style.paint(text, role)
 
 
 def bar(fraction: float, width: int = 30, fill: str = "█", empty: str = "░") -> str:
@@ -35,8 +34,8 @@ def bar(fraction: float, width: int = 30, fill: str = "█", empty: str = "░")
 
 
 def format_speed(download_mbps: float, upload_mbps: float) -> str:
-    return (f"Download: {c(f'{download_mbps:.2f}', _BOLD)} Mbit/s   "
-            f"Upload: {c(f'{upload_mbps:.2f}', _BOLD)} Mbit/s")
+    return (f"Download: {c(f'{download_mbps:.2f}', 'bold')} Mbit/s   "
+            f"Upload: {c(f'{upload_mbps:.2f}', 'bold')} Mbit/s")
 
 
 def render_result(result: SpeedTestResult, show_server: bool = True) -> str:
@@ -44,42 +43,42 @@ def render_result(result: SpeedTestResult, show_server: bool = True) -> str:
     out: list[str] = []
     srv = result.server
     if show_server and srv is not None:
-        out.append(f"Hosted by {c(srv.sponsor, _BOLD)} ({srv.name}) "
-                   f"[{srv.cc}] {c(f'{srv.distance_km:.0f} km', _DIM)}")
+        out.append(f"Hosted by {c(srv.sponsor, 'bold')} ({srv.name}) "
+                   f"[{srv.cc}] {c(f'{srv.distance_km:.0f} km', 'dim')}")
     if result.latency.avg_ms is not None:
-        out.append(f"Ping: {c(f'{result.latency.avg_ms:.2f}', _BOLD)} ms   "
+        out.append(f"Ping: {c(f'{result.latency.avg_ms:.2f}', 'bold')} ms   "
                    f"jitter: {result.latency.jitter_ms:.2f} ms   "
                    f"loss: {result.latency.loss_pct:.0f}%")
     else:
-        out.append("Ping: " + c("unavailable", _BOLD) +
+        out.append("Ping: " + c('unavailable', 'bold') +
                    "   (latency probe failed; not reporting a placeholder)")
     out.append(format_speed(result.download_mbps, result.upload_mbps))
     if result.share_url:
         out.append(f"Share: {result.share_url}")
     for err in result.errors:
-        out.append(c(f"  warning: {err}", _DIM))
+        out.append(c(f'  warning: {err}', 'dim'))
     return "\n".join(out)
 
 
 def _hop_loss_color(hop: Hop) -> str:
     if hop.received == 0:
-        return c("100.0%", "\033[31m")
+        return c("100.0%", "bad")
     if hop.loss_pct >= 20:
-        return c(f"{hop.loss_pct:5.1f}%", "\033[31m")
+        return c(f"{hop.loss_pct:5.1f}%", "bad")
     if hop.loss_pct > 0:
-        return c(f"{hop.loss_pct:5.1f}%", "\033[33m")
-    return c(f"{hop.loss_pct:5.1f}%", "\033[32m")
+        return c(f"{hop.loss_pct:5.1f}%", "warn")
+    return c(f"{hop.loss_pct:5.1f}%", "good")
 
 
 def _hop_ms_color(hop: Hop) -> str:
     avg = hop.avg_ms
     if avg is None:
-        return c("     ---   ", _DIM)
+        return c('     ---   ', 'dim')
     if avg > 150:
-        return c(f"{avg:8.2f} ms", "\033[31m")
+        return c(f"{avg:8.2f} ms", "bad")
     if avg > 60:
-        return c(f"{avg:8.2f} ms", "\033[33m")
-    return c(f"{avg:8.2f} ms", "\033[32m")
+        return c(f"{avg:8.2f} ms", "warn")
+    return c(f"{avg:8.2f} ms", "good")
 
 
 def render_trace(trace: TraceResult, width: int = 30) -> str:
@@ -92,8 +91,8 @@ def render_trace(trace: TraceResult, width: int = 30) -> str:
     out: list[str] = []
     header = (f"{'Hop':>3}  {'Loss%':>6}  {'Snt':>3}  {'Last':>9}  "
               f"{'Avg':>9}  {'Best':>9}  {'Worst':>9}  {'Jitter':>7}  Address")
-    out.append(c(header, _BOLD))
-    out.append(c("-" * len(header), _DIM))
+    out.append(c(header, 'bold'))
+    out.append(c('-' * len(header), 'dim'))
     for hop in trace.hops:
         label = hop.host or hop.addr or "*"
         if not hop.host and hop.addr:
@@ -116,11 +115,11 @@ def render_trace(trace: TraceResult, width: int = 30) -> str:
         )
     out.append("")
     if trace.destination_reached:
-        out.append(c("Destination reached", "\033[32m"))
+        out.append(c("Destination reached", "good"))
     else:
-        out.append(c("Destination NOT reached", "\033[31m"))
+        out.append(c("Destination NOT reached", "bad"))
     if trace.error:
-        out.append(c(f"  {trace.error}", _DIM))
+        out.append(c(f'  {trace.error}', 'dim'))
     return "\n".join(out)
 
 
@@ -147,21 +146,21 @@ def render_loss_summary(trace: TraceResult) -> str:
             lines.append(c(
                 f"Final hop shows {final.loss_pct:.0f}% loss "
                 f"({final.received}/{final.sent} replies) "
-                f"- path to the server is lossy", "\033[31m"))
+                f"- path to the server is lossy", "bad"))
         else:
             lines.append(c(
-                f"Final hop: 0% loss over {final.sent} probes", "\033[32m"))
+                f"Final hop: 0% loss over {final.sent} probes", "good"))
 
     if culprit is not None:
         lines.append(c(
             f"Latency jump at hop {culprit.ttl} "
             f"({culprit.addr or 'unknown'}): "
             f"{culprit.avg_ms:.1f} ms - upstream congestion begins here",
-            "\033[33m"))
+            "warn"))
     elif final is not None and final.avg_ms is not None:
         lines.append(c(
             f"No significant latency jump across the path; "
-            f"end-to-end latency {final.avg_ms:.1f} ms", "\033[32m"))
+            f"end-to-end latency {final.avg_ms:.1f} ms", "good"))
     return "\n".join(lines)
 
 
@@ -169,13 +168,13 @@ def render_server_table(servers: Iterable, limit: int = 10) -> str:
     """Render the candidate server list, nearest first."""
     out: list[str] = []
     out.append(c(f"{'#':>3}  {'Distance':>9}  {'Latency':>9}  "
-                 f"{'Spons':<24} Location", _BOLD))
-    out.append(c("-" * 78, _DIM))
+                 f"{'Spons':<24} Location", "bold"))
+    out.append(c("-" * 78, "dim"))
     for i, s in enumerate(servers):
         if i >= limit:
             break
         lat = (f"{s.latency_ms:.2f} ms" if s.latency_ms is not None
-               else c("     ---   ", _DIM))
+               else c('     ---   ', 'dim'))
         out.append(f"{i + 1:>3}  {s.distance_km:>7.0f} km  {lat:>9}  "
                    f"{s.sponsor[:24]:<24} {s.name}")
     return "\n".join(out)

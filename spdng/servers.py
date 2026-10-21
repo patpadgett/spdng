@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:25.0) Gecko/20100101 Firefox/25.0"
@@ -41,6 +41,10 @@ class Server:
     jitter_ms: float | None = None
     loss_pct: float | None = None
     https_functional: bool = True
+    #: Which provider produced this server.
+    provider: str = "ookla"
+    #: Provider-specific endpoint paths, when they differ from the default.
+    endpoints: dict[str, str] = field(default_factory=dict)
 
     @property
     def base(self) -> str:

@@ -261,7 +261,189 @@ def test_live_server_list():
 
 @pytest.mark.live
 def test_live_latency_against_nearest_server():
-    s = servers.rank_servers(servers.fetch_servers(limit=20))[0]
-    lat = measure.measure_latency(s.base, count=3, timeout=15)
+    from spdng.providers.ookla import OoklaProvider
+    provider = OoklaProvider()
+    s = provider.list_servers(limit=20)[0]
+    lat = provider.measure_latency(s, count=3, timeout=15)
     assert lat.avg_ms is not None
     assert lat.avg_ms < 2000
+
+
+@pytest.mark.live
+def test_live_cloudflare_provider():
+    from spdng.providers.cloudflare import CloudflareProvider
+    provider = CloudflareProvider()
+    s = provider.list_servers(limit=1)[0]
+    lat = provider.measure_latency(s, count=3, timeout=15)
+    assert lat.avg_ms is not None
+    assert lat.avg_ms < 2000
+
+
+@pytest.mark.live
+def test_live_librespeed_provider():
+    from spdng.providers.librespeed import LibreSpeedProvider
+    provider = LibreSpeedProvider()
+    srv = provider.list_servers(limit=3)
+    assert srv, "no LibreSpeed servers returned"
+    lat = provider.measure_latency(srv[0], count=2, timeout=15)
+    # Some community servers are unreachable from anywhere; that is fine,
+    # we only assert that the call returns cleanly.
+    assert lat.attempts == 2
+
+
+# --------------------------------------------------------------------------
+# providers
+# --------------------------------------------------------------------------
+
+def test_get_provider_by_name_and_alias():
+    from spdng import providers
+    assert providers.get_provider("ookla").id == "ookla"
+    assert providers.get_provider("speedtest.net").id == "ookla"
+    assert providers.get_provider("cf").id == "cloudflare"
+    assert providers.get_provider("CLOUDFLARE").id == "cloudflare"
+    assert providers.get_provider("librespeed").id == "librespeed"
+
+
+def test_get_provider_rejects_unknown():
+    from spdng import providers
+    with pytest.raises(providers.ProviderError):
+        providers.get_provider("does-not-exist")
+
+
+def test_all_providers_have_distinct_ids():
+    from spdng import providers
+    ids = [p.id for p in providers.all_providers()]
+    assert len(ids) == len(set(ids))
+    assert "ookla" in ids
+    assert "cloudflare" in ids
+    assert "librespeed" in ids
+
+
+def test_cloudflare_has_no_server_list():
+    """Cloudflare measures to the nearest DC, there is nothing to pick."""
+    from spdng.providers.cloudflare import CloudflareProvider
+    assert CloudflareProvider().has_server_list is False
+
+
+def test_provider_base_class_is_abstract():
+    from spdng.providers.base import Provider
+    p = Provider()
+    with pytest.raises(NotImplementedError):
+        p.list_servers()
+
+
+# --------------------------------------------------------------------------
+# style / colour
+# --------------------------------------------------------------------------
+
+def test_no_color_env_disables_colour(monkeypatch):
+    from spdng import style
+    monkeypatch.setenv("NO_COLOR", "1")
+    style.set_color(None)
+    assert style.color_enabled() is False
+    assert style.paint("hello", "red") == "hello"
+
+
+def test_force_color_env_enables_colour(monkeypatch):
+    from spdng import style
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    style.set_color(None)
+    assert style.color_enabled() is True
+    assert "\033[" in style.paint("hello", "red")
+
+
+def test_no_color_beats_force_color(monkeypatch):
+    from spdng import style
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    style.set_color(None)
+    assert style.color_enabled() is False
+
+
+def test_strip_ansi():
+    from spdng import style
+    assert style.strip_ansi("\033[31mred\033[0m") == "red"
+    assert style.strip_ansi("plain") == "plain"
+
+
+def test_every_theme_has_all_roles():
+    from spdng import style
+    roles = ("good", "ok", "warn", "bad", "accent", "muted", "heading", "value")
+    for name, theme in style.THEMES.items():
+        for role in roles:
+            assert theme.code(role) in style.CODES.values(), \
+                f"theme {name} role {role} has an unknown colour"
+
+
+def test_set_theme_falls_back_to_default():
+    from spdng import style
+    style.set_theme("no-such-theme")
+    assert style.theme().name == "default"
+    style.set_theme("default")
+
+
+# --------------------------------------------------------------------------
+# comparison rendering
+# --------------------------------------------------------------------------
+
+def _fake_result(download=100.0, upload=10.0, ping=20.0, jitter=1.0,
+                 loss=0.0, provider="ookla", sponsor="S", name="N"):
+    class FakeServer:
+        def __init__(self):
+            self.provider = provider
+            self.sponsor = sponsor
+            self.name = name
+            self.distance_km = 5.0
+
+        def to_dict(self):
+            return {"provider": provider}
+
+    r = measure.SpeedTestResult(server=FakeServer())
+    r.download_mbps = download
+    r.upload_mbps = upload
+    r.latency = measure.LatencyResult(samples_ms=[ping] * 3, errors=0,
+                                      attempts=3)
+    r.latency.samples_ms = [ping, ping, ping]
+    return r
+
+
+def test_render_comparison_lines_up_columns():
+    from spdng import compare
+    results = [
+        _fake_result(download=100.0, provider="ookla"),
+        _fake_result(download=50.0, provider="cloudflare", sponsor="CF"),
+    ]
+    out = compare.render_comparison(results, ["Ookla", "Cloudflare"])
+    assert "Ookla" in out and "Cloudflare" in out
+    assert "Download" in out
+    assert "100.00 Mbit/s" in out
+    assert "50.00 Mbit/s" in out
+
+
+def test_render_comparison_with_no_results():
+    from spdng import compare
+    assert "no results" in compare.render_comparison([])
+
+
+def test_render_repeat_comparison_reports_spread():
+    from spdng import compare
+    runs = [
+        _fake_result(download=100.0),
+        _fake_result(download=101.0),
+        _fake_result(download=99.0),
+    ]
+    out = compare.render_repeat_comparison(runs)
+    assert "spread" in out
+    assert "stable" in out
+
+
+def test_render_repeat_comparison_flags_variance():
+    from spdng import compare
+    runs = [
+        _fake_result(download=10.0),
+        _fake_result(download=200.0),
+    ]
+    out = compare.render_repeat_comparison(runs)
+    assert "very variable" in out
+

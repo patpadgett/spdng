@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import os
 import ssl
-import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -99,11 +97,16 @@ class SpeedTestResult:
     upload_detail: ThroughputResult = field(default_factory=ThroughputResult)
     share_url: str | None = None
     errors: list[str] = field(default_factory=list)
+    #: Which provider produced this result.
+    provider: str = "ookla"
+    provider_label: str = ""
 
     def to_dict(self) -> dict:
         srv = self.server.to_dict() if self.server is not None else None
         return {
             "server": srv,
+            "provider": self.provider,
+            "provider_label": self.provider_label,
             "download_mbps": round(self.download_mbps, 2),
             "upload_mbps": round(self.upload_mbps, 2),
             "latency": {
@@ -139,45 +142,22 @@ def _opener(ua: str) -> urllib.request.OpenerDirector:
     )
 
 
-def measure_latency(base_url: str, count: int = 5, timeout: float = 10.0,
-                    ua: str = DEFAULT_UA) -> LatencyResult:
-    """Measure latency by timing the latency.txt probe.
 
-    A probe that fails (timeout, non-200, wrong body) is recorded as an
-    error and excluded from the average. It is NEVER substituted with a
-    placeholder.
+def download_worker(url: str, ua: str, stop_at: float,
+                    counter: list[int], errors: list[int],
+                    chunk_size: int = 65536) -> None:
+    """Stream a URL until `stop_at`, counting bytes.
+
+    Shared by every provider: they differ in the URL, not in how the
+    transfer is counted.
     """
-    result = LatencyResult()
-    opener = _opener(ua)
-    for i in range(count):
-        result.attempts += 1
-        stamp = int(time.time() * 1000)
-        url = f"{base_url}/latency.txt?x={stamp}.{i}"
-        start = time.perf_counter()
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": ua, "Accept": "*/*", "Connection": "close"})
-            with opener.open(req, timeout=timeout) as resp:
-                body = resp.read(16)
-                rtt = (time.perf_counter() - start) * 1000
-                if resp.status == 200 and body.strip() == b"test=test":
-                    result.samples_ms.append(rtt)
-                else:
-                    result.errors += 1
-        except (urllib.error.URLError, OSError, ssl.SSLError):
-            result.errors += 1
-    return result
-
-
-def _download_worker(url: str, ua: str, stop_at: float,
-                     counter: list[int], errors: list[int]) -> None:
     opener = _opener(ua)
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": ua, "Accept": "*/*", "Connection": "close"})
         with opener.open(req, timeout=30) as resp:
             while time.perf_counter() < stop_at:
-                chunk = resp.read(65536)
+                chunk = resp.read(chunk_size)
                 if not chunk:
                     break
                 counter[0] += len(chunk)
@@ -185,38 +165,14 @@ def _download_worker(url: str, ua: str, stop_at: float,
         errors[0] += 1
 
 
-def measure_download(base_url: str, duration: float = 10.0, threads: int = 4,
-                     ua: str = DEFAULT_UA) -> ThroughputResult:
-    """Measure download throughput with N parallel connections."""
-    result = ThroughputResult(threads=threads)
-    stop_at = time.perf_counter() + duration
-    counter = [0]
-    errors = [0]
-    stamp = int(time.time() * 1000)
-    workers: list[threading.Thread] = []
-    for i in range(threads):
-        size = DOWNLOAD_SIZES[i % len(DOWNLOAD_SIZES)]
-        url = f"{base_url}/random{size}x{size}.jpg?x={stamp}.{i}"
-        t = threading.Thread(target=_download_worker,
-                             args=(url, ua, stop_at, counter, errors),
-                             daemon=True)
-        t.start()
-        workers.append(t)
-    start = time.perf_counter()
-    for t in workers:
-        t.join(timeout=duration + 15)
-    result.seconds = time.perf_counter() - start
-    result.bytes_transferred = counter[0]
-    result.errors = errors[0]
-    return result
-
-
-def _upload_worker(url: str, ua: str, stop_at: float,
-                   counter: list[int], errors: list[int]) -> None:
+def upload_worker(url: str, ua: str, stop_at: float,
+                  counter: list[int], errors: list[int],
+                  chunk_size: int = 1 << 16) -> None:
+    """POST random bytes to a URL until `stop_at`, counting bytes."""
     opener = _opener(ua)
     try:
         while time.perf_counter() < stop_at:
-            payload = os.urandom(1 << 16)
+            payload = os.urandom(chunk_size)
             req = urllib.request.Request(
                 url, data=payload, headers={
                     "User-Agent": ua,
@@ -230,54 +186,40 @@ def _upload_worker(url: str, ua: str, stop_at: float,
         errors[0] += 1
 
 
-def measure_upload(base_url: str, duration: float = 10.0, threads: int = 2,
-                   ua: str = DEFAULT_UA) -> ThroughputResult:
-    """Measure upload throughput with N parallel connections."""
-    result = ThroughputResult(threads=threads)
-    stop_at = time.perf_counter() + duration
-    counter = [0]
-    errors = [0]
-    url = f"{base_url}/upload.php?x={int(time.time() * 1000)}"
-    workers: list[threading.Thread] = []
-    for _ in range(threads):
-        t = threading.Thread(target=_upload_worker,
-                             args=(url, ua, stop_at, counter, errors),
-                             daemon=True)
-        t.start()
-        workers.append(t)
-    start = time.perf_counter()
-    for t in workers:
-        t.join(timeout=duration + 15)
-    result.seconds = time.perf_counter() - start
-    result.bytes_transferred = counter[0]
-    result.errors = errors[0]
-    return result
+# ---------------------------------------------------------------------------
+# Provider-specific measurement lives in spdng/providers/
+# ---------------------------------------------------------------------------
+# The functions below used to live here. They now belong to the provider
+# that owns the protocol, because each network has a different way of
+# measuring latency and throughput. What remains here is the shared
+# vocabulary: LatencyResult, ThroughputResult, SpeedTestResult, and the
+# HTTP opener that follows redirects (the bug that broke the old tool).
 
 
 def run_speedtest(server, duration: float = 10.0, threads: int = 4,
                   latency_samples: int = 5, do_upload: bool = True,
                   do_download: bool = True,
                   ua: str = DEFAULT_UA) -> SpeedTestResult:
-    """Run a full speed test against a Server."""
+    """Run a full speed test against a Server using the Ookla provider.
+
+    Kept as a convenience wrapper; the provider is the real interface.
+    """
+    from .providers.ookla import OoklaProvider
+
+    provider = OoklaProvider(ua=ua)
     result = SpeedTestResult(server=server)
-    base = server.base
-
-    result.latency = measure_latency(base, count=latency_samples, ua=ua)
-    if result.latency.avg_ms is None:
-        result.errors.append(
-            "latency probe failed against every server; "
-            "the server may require a browser session")
-
-    if do_download:
-        result.download_detail = measure_download(
-            base, duration=duration, threads=threads, ua=ua)
-        result.download_mbps = result.download_detail.mbps
-
-    if do_upload:
-        result.upload_detail = measure_upload(
-            base, duration=duration, threads=max(1, threads // 2), ua=ua)
-        result.upload_mbps = result.upload_detail.mbps
-
+    result.provider = provider.id
+    result.provider_label = provider.label
+    result.latency = provider.measure_latency(
+        server, count=latency_samples, ua=ua)
     server.latency_ms = result.latency.avg_ms
     server.jitter_ms = result.latency.jitter_ms
+    if do_download:
+        result.download_detail = provider.measure_download(
+            server, duration=duration, threads=threads)
+        result.download_mbps = result.download_detail.mbps
+    if do_upload:
+        result.upload_detail = provider.measure_upload(
+            server, duration=duration, threads=max(1, threads // 2))
+        result.upload_mbps = result.upload_detail.mbps
     return result
