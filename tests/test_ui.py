@@ -442,3 +442,77 @@ def test_the_version_is_the_same_everywhere():
         assert match.group(1) == spdng.__version__, (
             f"pyproject says {match.group(1)}, the package says "
             f"{spdng.__version__}")
+
+
+def test_the_fallback_redraws_in_place():
+    """A non-interactive run must not scroll once per round.
+
+    The fallback writes the frame, moves the cursor back up over it and
+    writes it again, so the output is one frame, not one frame per round.
+    """
+
+    from spdng.tui import Screen
+
+    screen = Screen("test")
+    screen.fallback = True
+    screen._fallback_rows = 0
+    screen._fallback_lines = []
+
+    captured = []
+
+    class FakeOut:
+        def write(self, text):
+            captured.append(text)
+
+        def flush(self):
+            pass
+
+    import sys
+    real = sys.stdout
+    sys.stdout = FakeOut()
+    try:
+        screen.print_frame(["line one", "line two"])
+        screen.print_frame(["line one", "line two"])
+    finally:
+        sys.stdout = real
+
+    out = "".join(captured)
+    # The second frame must move the cursor back up over the first.
+    assert "[3A" in out, f"expected a cursor-up, got {out!r}"
+    # And each line is cleared before it is written.
+    assert out.count("[2K") >= 4
+
+
+def test_the_fallback_counts_rows_not_strings():
+    """A frame element can contain newlines, so rows != strings."""
+    from spdng.tui import Screen
+
+    screen = Screen("test")
+    screen.fallback = True
+    screen._fallback_rows = 0
+    screen._fallback_lines = []
+
+    captured = []
+
+    class FakeOut:
+        def write(self, text):
+            captured.append(text)
+
+        def flush(self):
+            pass
+
+    import sys
+    real = sys.stdout
+    sys.stdout = FakeOut()
+    try:
+        screen.print_frame(["a\nb", "c"])
+    finally:
+        sys.stdout = real
+
+    out = "".join(captured)
+    # "a\nb" is two rows, "c" is one, so 3 rows plus the cursor's own
+    # line: the next frame moves up 4.
+    screen._fallback_rows = sum(
+        len(line.split("\n")) for line in ["a\nb", "c"]) + 1
+    assert screen._fallback_rows == 4
+    assert out.count("\r\n") == 3

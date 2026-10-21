@@ -84,6 +84,7 @@ class Screen:
         self._stdscr = None
         self.fallback = not supports_curses()
         self._fallback_lines: list[str] = []
+        self._fallback_rows = 0
         self._prev_size = (0, 0)
 
     def __enter__(self) -> Screen:
@@ -195,16 +196,49 @@ class Screen:
     # -- fallback drawing -------------------------------------------------
 
     def print_frame(self, lines: list[str]) -> None:
-        """In fallback mode, print a frame."""
+        """Draw a frame.
+
+        In curses mode this clears the screen and redraws in place. In
+        fallback mode there is no screen to clear, so we move the cursor
+        back up over the previous frame and redraw it there. That way a
+        non-interactive run scrolls once, not once per round.
+        """
         if self.fallback or self._stdscr is None:
-            for line in lines:
-                print(line)
-            print()
+            self._print_fallback_frame(lines)
             return
         self.clear()
         for i, line in enumerate(lines):
             self.addstr(i, 0, line)
         self.refresh()
+
+    def _print_fallback_frame(self, lines: list[str]) -> None:
+        """Redraw in place, without a terminal that can clear itself.
+
+        A "line" here may itself contain newlines, so the number of
+        terminal ROWS a frame occupies is not the number of strings in
+        it. Count the rows properly, or the cursor-up lands in the wrong
+        place and the frames run into each other.
+        """
+        out = sys.stdout
+        if self._fallback_rows:
+            # The cursor sits on the row after the last one, so we move up
+            # that many rows to get back to the top of the frame.
+            out.write(f"\r\033[{self._fallback_rows}A")
+        for line in lines:
+            for i, part in enumerate(line.split("\n")):
+                if i:
+                    out.write("\r\n")
+                out.write("\033[2K" + part)
+            out.write("\r\n")
+        out.flush()
+        self._fallback_lines = list(lines)
+        self._fallback_rows = sum(
+            len(line.split("\n")) for line in lines) + 1
+
+    def finish_fallback(self) -> None:
+        """Leave the fallback in a state where the next print starts fresh."""
+        self._fallback_lines = []
+        self._fallback_rows = 0
 
 
 def key_name(code: int) -> str:
