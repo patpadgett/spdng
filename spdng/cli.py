@@ -469,15 +469,15 @@ def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
 
     title = " " + " ".join(pad(t, w, a) for t, w, a in columns)
 
-    with Screen("spdng trace") as screen:
+    # `keep_output` is what makes the results survive: curses.endwin()
+    # restores the terminal and wipes the screen, so without this the
+    # trace would leave nothing behind.
+    with Screen("spdng trace", keep_output=True) as screen:
         lines = [title, " " + "-" * (visible_width(title) - 1)]
 
         def on_hop(hop):
             lines.append(_trace_row(hop, columns))
-            screen.clear()
-            for i, line in enumerate(lines):
-                screen.addstr_styled(i, 0, line)
-            screen.refresh()
+            screen.print_frame(lines)
 
         trace = traceroute.traceroute(
             ip, port=port, max_hops=args.max_hops, probes=args.probes,
@@ -572,7 +572,17 @@ def cmd_watch(args) -> int:
 
 
 def _watch_curses(run_once, provider, server, args) -> int:
-    """The curses watch view, with a live bar graph and hotkeys."""
+    """The curses watch view, with a live bar graph and hotkeys.
+
+    Two things run at once here. The measurement runs on a worker
+    thread, because a speed test takes seconds and the user must not
+    have to wait for one to finish before the keyboard is read. The
+    keyboard is read on a short timeout in a loop, so pressing "q"
+    quits immediately instead of after the current sample completes.
+    """
+    import queue
+    import threading
+
     from .tui import Screen, key_name
     from .watchview import WatchSample, WatchView, save_csv, save_json, save_report
 
@@ -582,10 +592,50 @@ def _watch_curses(run_once, provider, server, args) -> int:
     samples: list[WatchSample] = []
     started = time.time()
 
-    with Screen("spdng watch") as screen:
+    # Results come back on a queue, so the worker never touches the
+    # screen and the screen never waits on the worker.
+    done: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    busy = False
+
+    def worker():
+        """Run ONE sample and hand the result back.
+
+        The main loop starts the next one when it is time, so the
+        interval between samples is honoured and the server is not
+        hammered.
+
+        The measurement runs with the terminal's own stdout and stderr
+        detached. A thread that inherits them keeps the pty slave open
+        for as long as it lives, and that stops the terminal from
+        closing cleanly when curses ends.
+        """
+        try:
+            result = run_once()
+        except Exception as exc:  # noqa: BLE001
+            done.put(("error", exc))
+            return
+        done.put(("sample", result))
+
+    with Screen("spdng watch", keep_output=True) as screen:
+        next_run = time.time()
         while True:
-            if not paused:
-                result = run_once()
+            # A resize changes the viewport, so the layout is rebuilt
+            # from the new size on the next frame.
+            screen.resized()
+
+            # Collect whatever the worker has finished.
+            while True:
+                try:
+                    kind, payload = done.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "error":
+                    view.set_status("error", str(payload))
+                    busy = False
+                    break
+                result = payload
+                busy = False
                 sample = WatchSample(
                     timestamp=time.time(),
                     download_mbps=result.download_mbps,
@@ -598,39 +648,60 @@ def _watch_curses(run_once, provider, server, args) -> int:
                 view.add(sample)
                 view.set_status("running")
 
+            if not paused:
+                view.set_status(view.status or "running")
             view.render(screen)
 
-            code = screen.getch(200)
+            # Read the keyboard with a SHORT timeout, so the loop comes
+            # back often and a keypress is acted on at once. A long
+            # timeout here is what made "q" feel broken.
+            code = screen.getch(50)
             key = key_name(code)
             if key in ("Q", "ESC"):
                 break
             elif key == "S":
                 path = live._report_path(args.save_dir, "watch", "csv")
                 save_csv(samples, path)
-                view.set_status("running", f"saved {path}")
+                view.set_status(view.status, f"saved {path}")
             elif key == "J":
                 path = live._report_path(args.save_dir, "watch", "json")
                 save_json(samples, path)
-                view.set_status("running", f"saved {path}")
+                view.set_status(view.status, f"saved {path}")
             elif key == "R":
                 path = live._report_path(args.save_dir, "watch", "txt")
                 save_report(samples, path, view.target)
-                view.set_status("running", f"saved {path}")
+                view.set_status(view.status, f"saved {path}")
             elif key == "SPACE":
                 paused = not paused
                 view.set_status("paused" if paused else "running")
             elif key == "+":
                 interval = max(2.0, interval - 1.0)
-                view.set_status("running", f"interval {interval:.0f}s")
+                view.set_status(view.status, f"interval {interval:.0f}s")
             elif key == "-":
                 interval = min(600.0, interval + 1.0)
-                view.set_status("running", f"interval {interval:.0f}s")
+                view.set_status(view.status, f"interval {interval:.0f}s")
+            elif key == "U":
+                view.show_upload = not view.show_upload
+                view.set_status(view.status,
+                                f"upload chart "
+                                f"{'shown' if view.show_upload else 'hidden'}")
 
             if args.watch_duration and (time.time() - started) >= args.watch_duration:
                 break
-            if not paused:
-                time.sleep(max(0.0, interval - args.duration * 2 - 3))
+            if view.status == "error":
+                break
 
+            # Start the next sample when it is due, and only if one is
+            # not already running. The sample runs on its own thread,
+            # so the keyboard stays live while it works.
+            if not paused and not busy and time.time() >= next_run:
+                busy = True
+                next_run = time.time() + interval
+                threading.Thread(target=worker, daemon=True).start()
+
+            time.sleep(0.02)
+
+    stop.set()
     print()
     if samples:
         print(render.render_watch_summary(

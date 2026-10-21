@@ -42,6 +42,11 @@ class WatchView:
     status: str = "starting"
     message: str = ""
     max_samples: int = 0
+    #: Whether the upload TIME-BASED chart is shown, on the right of
+    #: the download chart. The user toggles it with "u". The upload
+    #: STAT bar above is always shown - that is a different thing, the
+    #: current upload rate, and it is worth seeing.
+    show_upload: bool = True
     _started: float = field(default_factory=time.time)
 
     def add(self, sample: WatchSample) -> None:
@@ -81,22 +86,57 @@ class WatchView:
         return rows
 
     def _stat_line(self, label: str, unit: str, peak: float, last: float,
-                   avg: float) -> str:
-        """A padded summary line, so the numbers sit under each other."""
-        from .table import pad
-        return (f"    {pad('peak', 10)}{peak:>8.1f} {unit}   "
-                f"{pad('last', 6)}{last:>8.1f}   "
-                f"{pad('avg', 5)}{avg:>8.1f}")
+                   avg: float, width: int = 0) -> str:
+        """A padded summary line, so the numbers sit under each other.
 
-    def render_lines(self, width: int = 100) -> list[str]:
-        """The frame as a list of strings."""
+        The line is trimmed to fit the terminal: the "avg" field goes
+        first, because peak and last are the numbers you read.
+        """
+        from .table import pad
+        parts = [
+            f"    {pad('peak', 10)}{peak:>8.1f} {unit}",
+            f"   {pad('last', 6)}{last:>8.1f}",
+            f"   {pad('avg', 5)}{avg:>8.1f}",
+        ]
+        line = parts[0]
+        for extra in parts[1:]:
+            if width and len(line) + len(extra) > width:
+                break
+            line += extra
+        return line
+
+    def render_lines(self, width: int = 100, height: int = 0) -> list[str]:
+        """The frame as a list of strings.
+
+        `width` and `height` are the viewport size. The layout uses
+        the full width of the terminal, and the history chart grows to
+        fill whatever height is left over, so the view fills the screen
+        it was given instead of sitting in a 100x24 box in the corner.
+        """
         out: list[str] = []
         elapsed = time.time() - self._started
 
-        out.append(style.paint(
-            f" spdng watch -> {self.target}   "
-            f"{len(self.samples)} samples   {elapsed:.0f}s   {self.status} ",
-            "heading"))
+        # The header carries the target, which can be a long server
+        # name. It is shortened to fit, because a header that wraps
+        # pushes the whole layout down.
+        from .table import truncate
+        stats = (f"{len(self.samples)} samples   {elapsed:.0f}s   "
+                 f"{self.status} ")
+        # Build the header, then shorten the target until the WHOLE
+        # line fits. Working out the room by hand is how this ended
+        # up two characters too wide: the prefix, the separator and
+        # the ellipsis all count.
+        prefix = " spdng watch -> "
+        room = max(4, width - len(prefix) - len(stats) - 3)
+        target = truncate(self.target, room)
+        # Cut the target down until the whole line fits. The cut is on
+        # the character count, and it always makes the string SHORTER,
+        # so the loop terminates. (Truncating with an ellipsis does
+        # not: the ellipsis puts the length back, so a loop that
+        # truncates by one character each time never ends.)
+        while len(f"{prefix}{target}   {stats}") > width and target:
+            target = target[:-1]
+        out.append(style.paint(f"{prefix}{target}   {stats}", "heading"))
         if self.message:
             out.append(style.paint(f" {self.message}", "muted"))
         out.append("")
@@ -104,7 +144,7 @@ class WatchView:
         if not self.samples:
             out.append(style.paint("  waiting for the first sample...", "muted"))
             out.append("")
-            out.append(self._footer())
+            out.append(self._footer(width))
             return out
 
         dls = [s.download_mbps for s in self.samples]
@@ -114,21 +154,24 @@ class WatchView:
         peak_up = max(ups) or 1
         peak_ping = max(pings) if pings else 1
 
-        graph_width = max(20, min(64, width - 34))
+        # The graph takes the whole width, less room for the label.
+        graph_width = max(20, width - 34)
 
         # Download bar graph
         out.append(style.paint("  Download", "heading"))
         out.append(self._stat_line("Download", "Mbit/s", peak_dl, dls[-1],
-                                   sum(dls) / len(dls)))
+                                   sum(dls) / len(dls), width))
         bar = self._bar(dls[-1], peak_dl, graph_width)
         out.append("    " + style.paint(bar, "accent")
                    + f" {dls[-1]:>7.1f} Mbit/s")
         out.append("")
 
-        # Upload bar graph
+        # Upload stat bar. This always shows: it is the current upload
+        # rate, which is worth seeing. The "u" key toggles the
+        # TIME-BASED upload chart at the bottom, not this.
         out.append(style.paint("  Upload", "heading"))
         out.append(self._stat_line("Upload", "Mbit/s", peak_up, ups[-1],
-                                   sum(ups) / len(ups)))
+                                   sum(ups) / len(ups), width))
         bar = self._bar(ups[-1], peak_up, graph_width)
         out.append("    " + style.paint(bar, "ok")
                    + f" {ups[-1]:>7.1f} Mbit/s")
@@ -139,7 +182,7 @@ class WatchView:
         out.append(style.paint("  Ping", "heading"))
         if pings:
             out.append(self._stat_line("Ping", "ms", peak_ping, pings[-1],
-                                       sum(pings) / len(pings)))
+                                       sum(pings) / len(pings), width))
             inv = [(peak_ping - p) / peak_ping for p in pings]
             bar = self._bar(inv[-1], 1.0, graph_width)
             out.append("    " + style.paint(bar, "warn")
@@ -147,28 +190,154 @@ class WatchView:
         else:
             out.append(style.paint("    no ping samples yet", "muted"))
 
-        # The vertical chart, which shows the shape over time.
+        # The time-based charts at the bottom. These are the graphs that
+        # show the SHAPE of the measurement over time, as opposed to the
+        # stat bars above, which only show the current value.
+        #
+        # The download chart is on the left. The upload chart is on the
+        # right and can be switched on and off with "u", because the
+        # upload number is the least interesting of the three on most
+        # connections.
         out.append("")
-        out.append(style.paint("  Download over time", "heading"))
-        window = dls[-graph_width:]
-        chart = self._spark(window, height=8)
-        scale = (max(window) if window else 0) / len(chart) if chart else 0
-        for i, row in enumerate(chart):
-            level = len(chart) - i
-            value = scale * level
-            out.append(f"  {style.paint(row, 'accent')} {value:>8.1f}")
+        chart_height = self._chart_height(height, len(out) + 2)
+
+        if self.show_upload:
+            # Side by side. Each half gets an equal share of the width.
+            # A half is: 2 spaces of indent, the spark, a space, and an
+            # 8-character value, plus a 4-space gap between the halves.
+            half = max(24, (width - 4) // 2)
+            spark_width = max(10, half - 11)
+            dl_rows = self._chart_rows(dls, chart_height, spark_width)
+            up_rows = self._chart_rows(ups, chart_height, spark_width)
+            # Both charts must be the same width, or their columns do
+            # not line up. The sample windows are the same length, so
+            # the spark rows are the same length too.
+            assert all(len(r[0]) == spark_width for r in dl_rows), \
+                "the download chart is not the right width"
+            assert all(len(r[0]) == spark_width for r in up_rows), \
+                "the upload chart is not the right width"
+
+            # A row is: 2 indent + spark + 1 space + 8 value = 11 +
+            # spark_width, then a 4-space gap before the second half.
+            row_width = spark_width + 11
+            # The gap between the halves is exactly the space the
+            # second half's indent does not fill, so the two sparks
+            # start at the same offset.
+            # The headings sit over the sparks, which start at column
+            # 2 of each half.
+            # The headings sit over the sparks. The first spark starts
+            # at column 2, and the second at column spark_width + 16.
+            # The upload spark starts at column spark_width + 16 in the
+            # data rows: 2 indent + spark + 1 space + 7 for the value
+            # + 4 gap + 2 indent. The heading goes there too.
+            second_start = spark_width + 16
+            out.append(
+                "  " + style.paint("Download over time", "heading")
+                + " " * max(1, second_start - 2 - len("Download over time"))
+                + style.paint("Upload over time", "heading"))
+            for i in range(chart_height):
+                dl_spark, dl_value = dl_rows[i]
+                up_spark, up_value = up_rows[i]
+                # Each half is built the same way and is the same
+                # width, so the two sparks line up column for column.
+                left = ("  " + dl_spark.ljust(spark_width)
+                        + f" {dl_value:>7.1f}")
+                right = ("  " + up_spark.ljust(spark_width)
+                         + f" {up_value:>7.1f}")
+                out.append(style.paint(left, "accent")
+                           + "    " + style.paint(right, "ok"))
+        else:
+            # On its own, the download chart takes the whole width.
+            spark_width = max(20, width - 11)
+            dl_rows = self._chart_rows(dls, chart_height, spark_width)
+            out.append(style.paint("  Download over time", "heading"))
+            for i in range(chart_height):
+                spark, value = dl_rows[i]
+                out.append(
+                    "  " + style.paint(spark.ljust(spark_width), "accent")
+                    + f" {value:>7.1f}")
+
 
         out.append("")
-        out.append(self._footer())
+        out.append(self._footer(width))
         return out
 
-    def _footer(self) -> str:
-        return style.paint(
-            " q quit   s save csv   j save json   r save report   "
-            "space pause   +/- interval", "muted")
+    def _chart_rows(self, values: list[float], height: int,
+                    width: int) -> list[tuple[str, float]]:
+        """A time-based chart, as (spark_row, scale_value) pairs.
+
+        One column per sample, so the chart shows the shape of the
+        measurement rather than a single bar of the current value. The
+        scale value is what the top row of that row represents, so the
+        numbers down the side read as an axis.
+
+        Every row is exactly `width` columns wide. A short history is
+        padded on the LEFT, because the newest sample belongs on the
+        right and the chart scrolls left as samples arrive. If the rows
+        were not all the same width, the two charts side by side would
+        not line up.
+        """
+        if width <= 0:
+            return []
+        window = values[-width:]
+        chart = self._spark(window, height=height)
+        if not chart:
+            # No samples yet: the chart is still `width` wide, so the
+            # layout does not jump when the first sample lands.
+            return [(" " * width, 0.0) for _ in range(height)]
+        padding = width - len(chart[0])
+        if padding > 0:
+            chart = [" " * padding + row for row in chart]
+        peak = max(window) if window else 0
+        rows = []
+        for i, row in enumerate(chart):
+            level = len(chart) - i
+            rows.append((row, peak * level / len(chart)))
+        return rows
+
+    def _chart_height(self, viewport_height: int, used: int) -> int:
+        """How many rows the history chart gets.
+
+        The chart takes whatever height is left over, with a floor so it
+        is still readable and a ceiling so it does not become a wall of
+        blocks on a tall terminal.
+        """
+        if viewport_height <= 0:
+            return 8
+        left = viewport_height - used
+        return max(4, min(24, left))
+
+    def _footer(self, width: int = 100) -> str:
+        """The hotkey line, trimmed to fit the terminal.
+
+        The hints that do not fit are dropped from the end, so the ones
+        that survive are the ones you need most. "q quit" is always
+        kept, because a way out matters more than any other hint.
+        """
+        hints = [
+            "q quit", "s save csv", "j save json", "r save report",
+            "space pause", "+/- interval", "u upload",
+        ]
+        if not width:
+            return " " + "   ".join(hints)
+        chosen: list[str] = []
+        for hint in hints:
+            candidate = chosen + [hint]
+            if 1 + len("   ".join(candidate)) > width - 1:
+                break
+            chosen = candidate
+        if not chosen:
+            chosen = ["q quit"]
+        line = " " + "   ".join(chosen)
+        if len(line) > width:
+            # Even "q quit" does not fit, which means a very narrow
+            # terminal. Cut it to fit rather than wrapping.
+            line = line[:width]
+        return line
 
     def render(self, screen: Screen) -> list[str]:
-        lines = self.render_lines(screen.size()[1])
+        height, width = screen.size()
+        lines = self.render_lines(width, height)
         screen.print_frame(lines)
         return lines
 

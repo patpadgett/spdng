@@ -166,13 +166,25 @@ class Screen:
     inside the with block is identical.
     """
 
-    def __init__(self, title: str = "spdng") -> None:
+    def __init__(self, title: str = "spdng",
+                 keep_output: bool = False) -> None:
         self.title = title
         self._stdscr = None
         self.fallback = not supports_curses()
         self._fallback_lines: list[str] = []
         self._fallback_rows = 0
         self._prev_size = (0, 0)
+        #: The last frame drawn, so it can be re-printed when curses
+        #: ends.
+        self._last_frame: list[str] = []
+        #: Keep the final frame on the screen after curses exits.
+        #:
+        #: `curses.endwin()` restores the terminal to the state it was
+        #: in before curses started, which WIPES the screen. So a
+        #: curses run that ends leaves nothing behind: the results are
+        #: only visible while the program is running. With this set,
+        #: the final frame is printed again after endwin, so it stays.
+        self.keep_output = keep_output
 
     def __enter__(self) -> Screen:
         if self.fallback:
@@ -205,6 +217,12 @@ class Screen:
             except curses.error:
                 pass
             self._stdscr = None
+        if self.keep_output and self._last_frame:
+            # The screen was just restored, so the frame that was on it
+            # is gone. Put it back.
+            print()
+            for line in self._last_frame:
+                print(line)
 
     def _init_colors(self) -> None:
         """Map our theme roles onto curses colour pairs."""
@@ -356,22 +374,66 @@ class Screen:
         except curses.error:
             return -1
 
+    def resized(self) -> bool:
+        """Has the terminal changed size since the last check?
+
+        The size is re-read every time, so a view that asks for it
+        always gets the current one. This just says whether it CHANGED,
+        so a caller knows to re-lay-out its columns.
+        """
+        if self.fallback or self._stdscr is None:
+            return False
+        current = self.size()
+        if current == self._prev_size:
+            return False
+        self._prev_size = current
+        # Tell curses the terminal changed, so it re-reads the size and
+        # stops trying to use the old one.
+        try:
+            curses.update_lines_cols()
+        except (curses.error, AttributeError):
+            pass
+        try:
+            self._stdscr.clear()
+        except curses.error:
+            pass
+        return True
+
     # -- fallback drawing -------------------------------------------------
 
     def print_frame(self, lines: list[str]) -> None:
         """Draw a frame.
 
-        In curses mode this clears the screen and redraws in place. In
-        fallback mode there is no screen to clear, so we move the cursor
-        back up over the previous frame and redraw it there. That way a
-        non-interactive run scrolls once, not once per round.
+        In curses mode this redraws in place. The screen is NOT fully
+        cleared first: `clear()` marks every cell as changed, so the
+        terminal repaints the whole screen and the view flickers. So we
+        write over the top and then blank whatever is left below.
+
+        In fallback mode there is no screen to clear, so we move the
+        cursor back up over the previous frame and redraw it there. That
+        way a non-interactive run scrolls once, not once per round.
         """
+        self._last_frame = list(lines)
         if self.fallback or self._stdscr is None:
             self._print_fallback_frame(lines)
             return
-        self.clear()
+
+        height, width = self.size()
+        try:
+            self._stdscr.move(0, 0)
+        except curses.error:
+            pass
         for i, line in enumerate(lines):
+            if i >= height:
+                break
             self.addstr_styled(i, 0, line)
+        # Blank whatever the previous, longer frame left behind.
+        for y in range(len(lines), height):
+            try:
+                self._stdscr.move(y, 0)
+                self._stdscr.clrtoeol()
+            except curses.error:
+                pass
         self.refresh()
 
     def _print_fallback_frame(self, lines: list[str]) -> None:
@@ -660,7 +722,12 @@ class LiveTraceView:
             chosen = candidate
         if not chosen:
             chosen = ["q quit"]
-        return " " + "   ".join(chosen)
+        line = " " + "   ".join(chosen)
+        if len(line) > width:
+            # Even "q quit" does not fit, which means a very narrow
+            # terminal. Cut it to fit rather than wrapping.
+            line = line[:width]
+        return line
 
 
 def _fmt_ms(value: float | None) -> str:

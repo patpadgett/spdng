@@ -110,16 +110,46 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
     current_interval = interval
     round_no = 0
 
-    with Screen("spdng live trace") as screen:
+    # Probe results come back on a queue, so the probing happens on a
+    # worker thread and the keyboard is read while it works. A probe
+    # round can take a couple of seconds, and the user must not have to
+    # wait for it to finish before "q" is noticed.
+    import queue
+    import threading
+
+    results_queue: queue.Queue = queue.Queue()
+    stop = threading.Event()
+
+    def do_probe(ttl: int):
+        return probe_hop(ip, port, ttl, timeout, method)
+
+    def probe_round():
+        """One round of probes to every hop, in parallel."""
+        with ThreadPoolExecutor(max_workers=max(1, max_hops)) as pool:
+            return list(pool.map(do_probe, range(1, max_hops + 1)))
+
+    def worker():
+        while not stop.is_set():
+            try:
+                results = probe_round()
+            except Exception:  # noqa: BLE001
+                return
+            if stop.is_set():
+                return
+            results_queue.put(results)
+
+    with Screen("spdng live trace", keep_output=True) as screen:
+        threading.Thread(target=worker, daemon=True).start()
         while not should_quit:
             view._round = round_no
-            if not paused:
-                def do_probe(ttl: int):
-                    return probe_hop(ip, port, ttl, timeout, method)
 
-                with ThreadPoolExecutor(max_workers=max(1, max_hops)) as pool:
-                    results = list(pool.map(do_probe, range(1, max_hops + 1)))
+            # Take any round that has finished.
+            try:
+                results = results_queue.get_nowait()
+            except queue.Empty:
+                results = None
 
+            if results is not None and not paused:
                 # sent/received ACCUMULATE across rounds. The view tracks
                 # them per hop; these dicts are the running totals.
                 for ttl, addr, rtt, outcome in results:
@@ -139,12 +169,12 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
                         f"hops beyond it are not being measured")
                 round_no += 1
 
+            screen.resized()
             view.render(screen)
 
-            # Handle keys. We read with a short timeout so the loop stays
-            # responsive, and we check BEFORE the next probe round so a
-            # keypress is never swallowed by a slow round.
-            code = screen.getch(200)
+            # Handle keys. We read with a short timeout so the loop
+            # comes back often and a keypress is acted on at once.
+            code = screen.getch(50)
             key = key_name(code)
             if key in ("Q", "ESC"):
                 should_quit = True
@@ -174,11 +204,12 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
                 view._scroll = getattr(view, "_scroll", 0) + 1
 
             if not paused:
-                time.sleep(current_interval)
+                time.sleep(min(current_interval, 0.05))
 
             if rounds and round_no >= rounds:
                 should_quit = True
 
+    stop.set()
     print()
     return 0
 
