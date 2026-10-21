@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import curses
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -37,6 +38,92 @@ PROBE_OK = "."
 PROBE_TIMEOUT = "o"
 PROBE_REFUSED = "O"
 PROBE_ERROR = "X"
+
+#: The SGR colour codes we understand, and the base curses colour each
+#: one means. The bright variants (90-97) map to the same base colour
+#: here; on a terminal with 16 or more colours they get their own
+#: colour number instead (see `_sgr_color_table`).
+_SGR_BASE_COLORS: dict[str, int] = {
+    "30": curses.COLOR_BLACK,
+    "31": curses.COLOR_RED,
+    "32": curses.COLOR_GREEN,
+    "33": curses.COLOR_YELLOW,
+    "34": curses.COLOR_BLUE,
+    "35": curses.COLOR_MAGENTA,
+    "36": curses.COLOR_CYAN,
+    "37": curses.COLOR_WHITE,
+    "90": curses.COLOR_BLACK,
+    "91": curses.COLOR_RED,
+    "92": curses.COLOR_GREEN,
+    "93": curses.COLOR_YELLOW,
+    "94": curses.COLOR_BLUE,
+    "95": curses.COLOR_MAGENTA,
+    "96": curses.COLOR_CYAN,
+    "97": curses.COLOR_WHITE,
+}
+
+#: SGR codes that are text attributes rather than colours.
+_SGR_ATTRIBUTES: dict[str, int] = {
+    "1": curses.A_BOLD,
+    "2": curses.A_DIM,
+    "3": curses.A_ITALIC,
+    "4": curses.A_UNDERLINE,
+}
+
+#: The bright SGR codes, in the order they appear in 90-97.
+_BRIGHT_CODES = ["90", "91", "92", "93", "94", "95", "96", "97"]
+
+_ANSI_SGR = re.compile(r"\033\[([0-9;]*)m")
+
+
+def _sgr_color_table() -> dict[str, int]:
+    """The SGR code -> curses colour number map for this terminal.
+
+    On a terminal with 16 colours or more, the bright codes (90-97) get
+    their own colour numbers (8-15) so that grey is grey and not black.
+    On an 8-colour terminal they fall back to the base colour, and the
+    bright look is approximated with the bold attribute.
+    """
+    table = dict(_SGR_BASE_COLORS)
+    try:
+        colours = curses.COLORS
+    except AttributeError:
+        colours = 8
+    if colours >= 16:
+        for offset, code in enumerate(_BRIGHT_CODES):
+            table[code] = 8 + offset
+    return table
+
+
+def ansi_segments(text: str) -> list[tuple[str, str, int]]:
+    """Split a coloured string into (text, colour_code, attributes).
+
+    The colour code is the SGR colour in force for that segment, or "0"
+    for the default. The attributes are a bitmask of curses attributes
+    (bold, dim, underline) in force at that point.
+    """
+    colour_table = _sgr_color_table()
+    segments: list[tuple[str, str, int]] = []
+    colour = "0"
+    attributes = 0
+    pos = 0
+    for match in _ANSI_SGR.finditer(text):
+        chunk = text[pos:match.start()]
+        if chunk:
+            segments.append((chunk, colour, attributes))
+        for part in (match.group(1) or "0").split(";"):
+            if part == "" or part == "0":
+                colour = "0"
+                attributes = 0
+            elif part in _SGR_ATTRIBUTES:
+                attributes |= _SGR_ATTRIBUTES[part]
+            elif part in colour_table:
+                colour = part
+        pos = match.end()
+    tail = text[pos:]
+    if tail:
+        segments.append((tail, colour, attributes))
+    return segments
 
 
 @dataclass(slots=True)
@@ -139,6 +226,20 @@ class Screen:
             except curses.error:
                 continue
 
+        # A pair for every SGR colour code we emit, so a pre-painted
+        # string can be re-coloured through curses.
+        self._sgr_pairs: dict[str, int] = {}
+        n = max(self._pairs.values(), default=0) + 1
+        for code, fg in _sgr_color_table().items():
+            if n >= curses.COLOR_PAIRS:
+                break
+            try:
+                curses.init_pair(n, fg, -1)
+            except curses.error:
+                continue
+            self._sgr_pairs[code] = n
+            n += 1
+
     # -- drawing ---------------------------------------------------------
 
     def size(self) -> tuple[int, int]:
@@ -160,7 +261,18 @@ class Screen:
         self._stdscr.refresh()
 
     def addstr(self, y: int, x: int, text: str, role: str | None = None) -> None:
-        """Draw a string at a position, clipping to the screen."""
+        """Draw a string at a position, clipping to the screen.
+
+        IMPORTANT: `text` must NOT contain ANSI escape sequences. Curses
+        has its own colour model, and a raw ESC byte drawn into the
+        screen appears as the two literal characters "^[" - so a
+        pre-painted string shows up as "^[[32m" garbage on screen.
+
+        So the curses path draws plain text and applies the colour
+        through a curses colour pair instead. The fallback path is the
+        other way around: it prints the string, ANSI and all, because a
+        normal terminal interprets those.
+        """
         if self.fallback or self._stdscr is None:
             return
         height, width = self.size()
@@ -181,6 +293,57 @@ class Screen:
             # Writing to the bottom-right corner always raises; that is
             # normal and not worth reporting.
             pass
+
+    def addstr_styled(self, y: int, x: int, text: str,
+                      role: str | None = None) -> None:
+        """Draw a string, translating any ANSI it carries into curses.
+
+        Curses has its own colour model. A raw ESC byte written into the
+        screen comes out as the two literal characters "^[", so a
+        pre-painted string renders as "^[[32m" garbage.
+
+        So the ANSI is parsed out and the colour is re-applied through a
+        curses colour pair. The colour survives and the screen never
+        shows an escape character.
+        """
+        if self.fallback or self._stdscr is None:
+            return
+        if "\033[" not in text:
+            self.addstr(y, x, text, role)
+            return
+
+        width = self.size()[1]
+        col = x
+        for chunk, code, attributes in ansi_segments(text):
+            if col >= width:
+                break
+            if not chunk:
+                continue
+            room = width - col
+            if len(chunk) > room:
+                chunk = chunk[:room]
+            attr = self._attr_for(code, attributes)
+            try:
+                if attr:
+                    self._stdscr.addstr(y, col, chunk, attr)
+                else:
+                    self._stdscr.addstr(y, col, chunk)
+            except curses.error:
+                pass
+            col += len(chunk)
+
+    def _attr_for(self, sgr_code: str, attributes: int = 0) -> int:
+        """The curses attribute for an SGR colour code and attributes."""
+        attr = attributes
+        if sgr_code and sgr_code != "0":
+            pair = self._sgr_pairs.get(sgr_code)
+            if pair:
+                attr |= curses.color_pair(pair)
+            # On an 8-colour terminal a bright colour is approximated
+            # with the bold attribute.
+            elif sgr_code in _BRIGHT_CODES:
+                attr |= curses.A_BOLD
+        return attr
 
     def getch(self, timeout_ms: int = 250) -> int:
         """Read a key, or -1 on timeout."""
@@ -208,7 +371,7 @@ class Screen:
             return
         self.clear()
         for i, line in enumerate(lines):
-            self.addstr(i, 0, line)
+            self.addstr_styled(i, 0, line)
         self.refresh()
 
     def _print_fallback_frame(self, lines: list[str]) -> None:
@@ -284,6 +447,9 @@ class LiveTraceView:
         self.message = ""
         self._started = time.time()
         self._round = 0
+        #: The width of the screen, set when the view is drawn. The
+        #: separator rule is capped to it so it never wraps.
+        self._screen_width = 0
 
     def update_hop(self, ttl: int, address: str | None, rtt_ms: float | None,
                    outcome: str, sent: int, received: int) -> None:
@@ -325,6 +491,7 @@ class LiveTraceView:
 
     def render(self, screen: Screen) -> list[str]:
         """Build the frame and draw it."""
+        self._screen_width = screen.size()[1]
         lines = self.render_lines()
         screen.print_frame(lines)
         return lines
@@ -345,6 +512,53 @@ class LiveTraceView:
         ("Host", 32, "<"),
     ]
 
+    #: The columns that never shrink, because their numbers need room.
+    FIXED_COLUMNS = 8
+
+    def _columns(self, screen_width: int) -> list[tuple[str, int, str]]:
+        """The column layout, fitted to the screen.
+
+        The full layout is 123 columns wide, which is wider than most
+        terminals. A row that is too long wraps, and a wrapped row
+        interleaves with the next one, so the table turns into
+        nonsense. So the history and host columns give way first: the
+        history shrinks to a readable minimum, and whatever is left goes
+        to the host name.
+        """
+        if not screen_width:
+            return list(self.COLUMNS)
+
+        fixed = self.COLUMNS[:self.FIXED_COLUMNS]
+        # A row is " " + cell + " " + cell + ... , so the leading space
+        # and the n-1 separating spaces come out of the budget too.
+        # The rule sits under the row and needs a column of its own.
+        used = sum(w for _, w, _ in fixed) + len(fixed)
+        spare = screen_width - used - 2
+
+        history_min, host_min = 10, 16
+        if spare < history_min + host_min:
+            # Even the minimums do not fit. Drop the optional columns
+            # that cost the least: StDev, then Best and Worst.
+            for droppable in ("StDev", "Best", "Worst", "Avg"):
+                names = [t for t, _, _ in fixed]
+                if droppable not in names:
+                    continue
+                if spare >= history_min + host_min:
+                    break
+                index = names.index(droppable)
+                fixed.pop(index)
+                used = sum(w for _, w, _ in fixed) + len(fixed)
+                # The same budget as above: the leading space, the
+                # separators, and a column for the rule.
+                spare = screen_width - used - 2
+            if spare < history_min + host_min:
+                return fixed
+
+        # Give the history a little more than the minimum if we can.
+        history = max(history_min, min(22, spare - host_min))
+        host = max(host_min, spare - history)
+        return fixed + [("History", history, "<"), ("Host", host, "<")]
+
     def render_lines(self) -> list[str]:
         """The frame as a list of strings, for the fallback and for saving."""
         from .table import pad
@@ -361,12 +575,27 @@ class LiveTraceView:
         out.append("")
 
         # Header, using the same padding as the body so they line up.
+        columns = self._columns(self._screen_width)
         header = " ".join(
             pad(style.paint(title, "heading"), width, align)
-            for title, width, align in self.COLUMNS)
+            for title, width, align in columns)
         out.append(" " + header)
-        out.append(style.paint(
-            " " + "-" * (len(header) + 8), "muted"))
+        # The rule is as long as the header, measured VISIBLY. Using
+        # len() on a coloured string counts the escape sequences and
+        # makes the rule far too long, which wraps and draws a second
+        # line under it.
+        from .table import visible_width
+        # The rule is exactly as wide as the row it sits under: the
+        # leading space plus the visible width of the header.
+        rule_len = visible_width(header) + 1
+        # Never wider than the screen. A line that reaches the last
+        # column makes curses raise when it writes there, and a line
+        # that is one too long wraps and draws a second line under
+        # itself.
+        screen_width = self._screen_width
+        if screen_width and rule_len > screen_width - 1:
+            rule_len = screen_width - 1
+        out.append(style.paint(" " + "-" * rule_len, "muted"))
 
         for hop in self.hops:
             loss = self._loss_pct(hop)
@@ -384,25 +613,54 @@ class LiveTraceView:
             history = _colour_history(hop["history"].render())
             addr = hop["address"] or "*"
 
+            # The values are looked up BY COLUMN TITLE, so a column that
+            # was dropped for width takes its value with it. Pairing by
+            # position instead shifts every value one column left.
+            by_title = {
+                "Hop": f"{hop['ttl']}",
+                "Loss%": style.paint(f"{loss:.1f}%", loss_role),
+                "Snt": f"{hop['sent']}",
+                "Last": _fmt_ms(hop["last_ms"]),
+                "Avg": _fmt_ms(avg),
+                "Best": _fmt_ms(hop["best_ms"]),
+                "Worst": _fmt_ms(hop["worst_ms"]),
+                "StDev": _fmt_ms(stdev),
+                "History": history,
+                "Host": style.paint(addr, "muted"),
+            }
             cells = [
-                pad(f"{hop['ttl']}", 4, ">"),
-                pad(style.paint(f"{loss:.1f}%", loss_role), 7, ">"),
-                pad(f"{hop['sent']}", 4, ">"),
-                pad(_fmt_ms(hop["last_ms"]), 9, ">"),
-                pad(_fmt_ms(avg), 9, ">"),
-                pad(_fmt_ms(hop["best_ms"]), 9, ">"),
-                pad(_fmt_ms(hop["worst_ms"]), 9, ">"),
-                pad(_fmt_ms(stdev), 8, ">"),
-                pad(history, 22, "<"),
-                pad(style.paint(addr, "muted"), 32, "<"),
+                pad(by_title.get(title, ""), width, align)
+                for title, width, align in columns
             ]
             out.append(" " + " ".join(cells))
 
         out.append("")
-        out.append(style.paint(
-            " q quit   s save csv   j save json   r save report   "
-            "space pause   +/- interval   up/down scroll", "muted"))
+        out.append(style.paint(self._footer(), "muted"))
         return out
+
+    def _footer(self) -> str:
+        """The hotkey line, trimmed to fit the screen.
+
+        The full line is 95 characters, which is wider than most
+        terminals. The least important hints go first, so the ones that
+        survive on a narrow screen are the ones you actually need.
+        """
+        hints = [
+            "q quit", "s save csv", "j save json", "r save report",
+            "space pause", "+/- interval", "up/down scroll",
+        ]
+        width = self._screen_width or 0
+        if not width:
+            return " " + "   ".join(hints)
+        chosen: list[str] = []
+        for hint in hints:
+            candidate = chosen + [hint]
+            if 1 + len("   ".join(candidate)) > width - 1:
+                break
+            chosen = candidate
+        if not chosen:
+            chosen = ["q quit"]
+        return " " + "   ".join(chosen)
 
 
 def _fmt_ms(value: float | None) -> str:

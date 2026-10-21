@@ -8,19 +8,38 @@ from . import style
 from .measure import SpeedTestResult
 from .traceroute import Hop, TraceResult
 
+#: The roles a theme defines. These are the names the views use.
+_THEME_ROLES = ("good", "ok", "warn", "bad", "accent", "muted", "heading",
+                "value")
+
 
 def c(text: str, code: str) -> str:
     """Colour text by theme role.
 
-    A role name from style.CODES (like "green" or "bold") is resolved
-    through the active theme. A raw ANSI code still works, for the rare
-    case where we need a specific colour the theme does not name.
+    A theme role ("good", "bad", "warn", "accent", ...) is resolved
+    through the active theme. A raw colour name from style.CODES ("green",
+    "bold", ...) is resolved the same way. A raw ANSI escape still works
+    for the rare case where we need a specific colour the theme does not
+    name.
+
+    Anything else is returned UNCHANGED. The old version wrapped an
+    unknown name in the escape sequence, so a typo like "bad" printed
+    the literal word "bad" before the text.
     """
-    if code in style.CODES:
+    if code in _THEME_ROLES:
         return style.paint(text, code)
+    if code in style.CODES:
+        # A literal colour name ("green", "bold", "dim") is a raw ANSI
+        # code, NOT a theme role. "green" is 32, not whatever the
+        # theme happens to call its good colour.
+        if not style.color_enabled():
+            return text
+        return f"\033[{style.CODES[code]}m{text}{style.RESET}"
     if not style.color_enabled():
         return text
-    return f"{code}{text}{style.RESET}"
+    if code.startswith("\033[") or code.startswith("\x1b["):
+        return f"{code}{text}{style.RESET}"
+    return text
 
 
 def themed(text: str, role: str) -> str:

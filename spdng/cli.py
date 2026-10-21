@@ -361,16 +361,128 @@ def cmd_trace(args) -> int:
                 continue
         port = port or 80
 
-    trace = traceroute.traceroute(
-        ip, port=port, max_hops=args.max_hops, probes=args.probes,
-        timeout=args.timeout, method=args.method)
-
+    # mtr shows each hop the moment it is measured, not after the whole
+    # path is done. So the traceroute hands us each hop as it lands and
+    # we print it right away. On a terminal the rows are redrawn in
+    # place, so it looks like mtr's updating table; piped to a file,
+    # each row is simply written as it arrives.
     if args.json:
+        trace = traceroute.traceroute(
+            ip, port=port, max_hops=args.max_hops, probes=args.probes,
+            timeout=args.timeout, method=args.method)
         print(json.dumps(trace.to_dict(), indent=2))
         return 0
 
+    return _stream_trace(ip, port, args)
+
+
+def _stream_trace(ip: str, port: int, args) -> int:
+    """Trace the path, showing each hop as soon as it is measured."""
+    from .tui import supports_curses
+
+    header = _trace_header()
+    if supports_curses():
+        return _stream_trace_curses(ip, port, args, header)
+    return _stream_trace_plain(ip, port, args, header)
+
+
+def _trace_header() -> list[tuple[str, int, str]]:
+    """The column layout of the streaming trace."""
+    return [
+        ("Hop", 4, ">"),
+        ("Loss%", 7, ">"),
+        ("Snt", 4, ">"),
+        ("Last", 9, ">"),
+        ("Avg", 9, ">"),
+        ("Best", 9, ">"),
+        ("Worst", 9, ">"),
+        ("Jitter", 8, ">"),
+        ("Address", 30, "<"),
+    ]
+
+
+def _trace_row(hop, columns) -> str:
+    """One hop as a row of cells."""
+    from .table import pad
+    loss = hop.loss_pct
+    if loss >= 50:
+        role = "bad"
+    elif loss > 0:
+        role = "warn"
+    else:
+        role = "good"
+
+    def ms(value):
+        return f"{value:.2f} ms" if value is not None else "---"
+
+    values = {
+        "Hop": f"{hop.ttl}",
+        "Loss%": style.paint(f"{loss:.1f}%", role),
+        "Snt": f"{hop.sent}",
+        "Last": ms(hop.last_ms),
+        "Avg": ms(hop.avg_ms),
+        "Best": ms(hop.best_ms),
+        "Worst": ms(hop.worst_ms),
+        "Jitter": ms(hop.jitter_ms),
+        "Address": hop.addr or "*",
+    }
+    # Built exactly like the header: a leading space, then the cells
+    # joined by a space. If the two are built differently they are a
+    # character apart, and every column after the first is off.
+    return " " + " ".join(
+        pad(values.get(title, ""), width, align)
+        for title, width, align in columns)
+
+
+def _stream_trace_plain(ip: str, port: int, args, columns) -> int:
+    """Print each hop as it is measured. No curses needed."""
+    from .table import pad, visible_width
+
+    title = " " + " ".join(
+        pad(t, w, a) for t, w, a in columns)
+    print(title)
+    print(" " + "-" * (visible_width(title) - 1))
+    sys.stdout.flush()
+
+    rows: list[str] = []
+
+    def on_hop(hop):
+        row = _trace_row(hop, columns)
+        rows.append(row)
+        print(row)
+        sys.stdout.flush()
+
+    trace = traceroute.traceroute(
+        ip, port=port, max_hops=args.max_hops, probes=args.probes,
+        timeout=args.timeout, method=args.method, on_hop=on_hop)
+
     print()
-    print(frames.trace_table(trace))
+    print(render.render_loss_summary(trace))
+    print()
+    return 0
+
+
+def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
+    """The mtr view: a table that fills in as the path is measured."""
+    from .table import pad, visible_width
+    from .tui import Screen
+
+    title = " " + " ".join(pad(t, w, a) for t, w, a in columns)
+
+    with Screen("spdng trace") as screen:
+        lines = [title, " " + "-" * (visible_width(title) - 1)]
+
+        def on_hop(hop):
+            lines.append(_trace_row(hop, columns))
+            screen.clear()
+            for i, line in enumerate(lines):
+                screen.addstr_styled(i, 0, line)
+            screen.refresh()
+
+        trace = traceroute.traceroute(
+            ip, port=port, max_hops=args.max_hops, probes=args.probes,
+            timeout=args.timeout, method=args.method, on_hop=on_hop)
+
     print()
     print(render.render_loss_summary(trace))
     print()

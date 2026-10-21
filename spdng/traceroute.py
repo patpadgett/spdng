@@ -33,6 +33,7 @@ import socket
 import struct
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # Cached measurement of `ping`'s process startup overhead in ms.
@@ -448,7 +449,8 @@ def _is_ip(text: str) -> bool:
 
 
 def _trace_ping(host: str, max_hops: int, probes: int, timeout: float,
-                result: TraceResult) -> TraceResult:
+                result: TraceResult,
+                on_hop: Callable[[Hop], None] | None = None) -> TraceResult:
     target_ip = _resolved_ip(host)
     for ttl in range(1, max_hops + 1):
         hop = Hop(ttl=ttl)
@@ -465,6 +467,8 @@ def _trace_ping(host: str, max_hops: int, probes: int, timeout: float,
             # with "time to live exceeded", our RTT is an estimate.
             hop.rtt_approximate = not exact
         result.hops.append(hop)
+        if on_hop is not None:
+            on_hop(hop)
         if hop.addr and hop.addr == target_ip:
             hop._final = True
             result.destination_reached = True
@@ -493,11 +497,17 @@ def traceroute(
     probes: int = 3,
     timeout: float = 2.0,
     method: str = "auto",
+    on_hop: Callable[[Hop], None] | None = None,
 ) -> TraceResult:
     """Trace the path to `host`, mtr style.
 
     method: "icmp" (raw socket), "udp" (IP_RECVERR), "ping" (ping binary),
     or "auto".
+
+    `on_hop` is called with each hop as soon as it has been measured, so
+    a caller can show the result immediately instead of waiting for the
+    whole path. mtr works this way: you see the first hop answer while
+    the rest of the path is still being measured.
     """
     if method == "auto":
         if has_raw_icmp():
@@ -511,13 +521,14 @@ def traceroute(
 
     if method == "icmp":
         try:
-            return _trace_icmp(host, max_hops, probes, timeout, result)
+            return _trace_icmp(host, max_hops, probes, timeout, result,
+                               on_hop)
         except PermissionError as exc:
             result.error = f"raw ICMP not permitted: {exc}"
             return result
     if method == "ping":
-        return _trace_ping(host, max_hops, probes, timeout, result)
-    return _trace_udp(host, port, max_hops, probes, timeout, result)
+        return _trace_ping(host, max_hops, probes, timeout, result, on_hop)
+    return _trace_udp(host, port, max_hops, probes, timeout, result, on_hop)
 
 
 def _resolved_ip(host: str) -> str:
@@ -529,7 +540,8 @@ def _resolved_ip(host: str) -> str:
 
 
 def _trace_icmp(host: str, max_hops: int, probes: int, timeout: float,
-                 result: TraceResult) -> TraceResult:
+                 result: TraceResult,
+                 on_hop: Callable[[Hop], None] | None = None) -> TraceResult:
     seq = 0
     for ttl in range(1, max_hops + 1):
         hop = Hop(ttl=ttl)
@@ -543,6 +555,8 @@ def _trace_icmp(host: str, max_hops: int, probes: int, timeout: float,
                 hop.rtts_ms.append(rtt)
                 hop.times_ms.append(rtt)
         result.hops.append(hop)
+        if on_hop is not None:
+            on_hop(hop)
         if hop.addr and _is_target(host, hop.addr):
             hop._final = True
             result.destination_reached = True
@@ -551,7 +565,8 @@ def _trace_icmp(host: str, max_hops: int, probes: int, timeout: float,
 
 
 def _trace_udp(host: str, port: int, max_hops: int, probes: int, timeout: float,
-               result: TraceResult) -> TraceResult:
+               result: TraceResult,
+               on_hop: Callable[[Hop], None] | None = None) -> TraceResult:
     for ttl in range(1, max_hops + 1):
         hop = Hop(ttl=ttl)
         reached = False
@@ -570,6 +585,8 @@ def _trace_udp(host: str, port: int, max_hops: int, probes: int, timeout: float,
                 hop.rtts_ms.append(rtt)
                 hop.times_ms.append(rtt)
         result.hops.append(hop)
+        if on_hop is not None:
+            on_hop(hop)
         if reached:
             hop.addr = hop.addr or host
             hop._final = True
