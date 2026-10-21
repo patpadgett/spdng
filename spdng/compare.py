@@ -18,18 +18,18 @@ def _fmt(value: float | None, unit: str, decimals: int = 2) -> str:
     return f"{value:.{decimals}f} {unit}"
 
 
-def _delta(new: float | None, old: float | None, *, higher_is_better: bool,
-           unit: str) -> str:
+def _delta(new: float | None, old: float | None, *,
+           higher_is_better: bool) -> str:
     """Render the change between two measurements."""
     if new is None or old is None or old == 0:
         return ""
     pct = (new - old) / old * 100
     if abs(pct) < 0.5:
-        return style.paint("  ~same", "muted")
+        return style.paint("~same", "muted")
     arrow = "▲" if pct > 0 else "▼"
     good = (pct > 0) == higher_is_better
     role = "good" if good else "bad"
-    return style.paint(f"{arrow} {abs(pct):+.1f}%", role)
+    return style.paint(f"{arrow}{abs(pct):.0f}%", role)
 
 
 def render_comparison(results: Sequence[SpeedTestResult],
@@ -46,42 +46,41 @@ def render_comparison(results: Sequence[SpeedTestResult],
         return "no results to compare"
 
     n = len(results)
-    titles = list(titles) if titles else [
-        f"#{i + 1}" for i in range(n)]
+    titles = list(titles) if titles else [f"#{i + 1}" for i in range(n)]
 
-    # Work out the widest label we need.
-    labels = ["Provider", "Server", "Distance", "Download", "Upload",
-              "Ping", "Jitter", "Loss"]
-    label_w = max(len(x) for x in labels) + 2
+    # Layout: the numeric rows live in strict columns so they line up and
+    # can be compared at a glance. The server details get their own lines,
+    # because forcing a long name like "Blue Stream Fiber" into a 20
+    # character column truncates it to uselessness.
+    total = max(76, style.term_width())
+    col_w = max(14, min(24, (total - 12) // n))
+    label_w = 11
 
-    # Column widths: give each column at least 15 chars, and let them grow
-    # to fill the terminal, but not so much that the table becomes a wall
-    # of whitespace.
-    total = max(78, style.term_width())
-    col_w = max(15, min(26, (total - label_w) // n))
+    def row(label: str, values: list[str]) -> str:
+        cells = "".join(f"{v:<{col_w}}" for v in values)
+        return f"{label:<{label_w}}{cells}"
 
     header = "".join(f"{t[:col_w - 1]:<{col_w}}" for t in titles)
     out = [style.paint(f"{'':<{label_w}}{header}", "heading")]
-    out.append(style.paint("─" * min(78, label_w + col_w * n), "dim"))
+    out.append(style.paint("─" * min(total, label_w + col_w * n), "dim"))
 
-    def row(label: str, values: list[str]) -> str:
-        cells = "".join(f"{v[:col_w - 1]:<{col_w}}" for v in values)
-        return f"{label:<{label_w}}{cells}"
+    out.append(style.paint(f"{'Server':<{label_w}}", "muted"))
+    for i, r in enumerate(results):
+        srv = r.server
+        detail = f"{srv.sponsor} {srv.name}" if srv is not None else "?"
+        out.append(f"{'':<{label_w}}{style.paint(detail, 'muted')}")
+        if i < len(results) - 1:
+            out.append("")
 
-    providers = []
-    servers = []
-    distances = []
+    out.append(style.paint(f"{'Provider':<{label_w}}", "muted"))
     for r in results:
         srv = r.server
-        providers.append(getattr(srv, "provider", "ookla") if srv else "?")
-        servers.append(f"{srv.sponsor} {srv.name}" if srv else "?")
-        distances.append(f"{srv.distance_km:.0f} km" if srv else "?")
+        prov = getattr(srv, "provider", "?") if srv else "?"
+        dist = f"{srv.distance_km:.0f} km" if srv and srv.distance_km else "-"
+        out.append(f"{'':<{label_w}}{style.paint(prov, 'accent')}  "
+                   f"{style.paint(dist, 'muted')}")
 
-    out.append(row("Provider", [style.paint(p, "accent") for p in providers]))
-    out.append(row("Server", [style.paint(v[:col_w - 1], "muted")
-                               for v in servers]))
-    out.append(row("Distance", distances))
-
+    out.append("")
     downloads = [r.download_mbps for r in results]
     uploads = [r.upload_mbps for r in results]
     pings = [r.latency.avg_ms for r in results]
@@ -102,16 +101,29 @@ def render_comparison(results: Sequence[SpeedTestResult],
         style.paint(_fmt(v, "%", 1), "good" if v == 0 else "bad")
         if v is not None else "n/a" for v in losses]))
 
-    if show_bars and downloads:
-        best = max(downloads) or 1
+    # With more than one column, show how each differs from the first.
+    if n > 1:
         out.append("")
-        out.append(style.paint(f"{'':<{label_w}}Download, relative to best", "dim"))
+        out.append(style.paint(f"{'':<{label_w}}vs first column", "dim"))
+        for label, values, better in (
+            ("Download", downloads, True),
+            ("Upload", uploads, True),
+            ("Ping", pings, False),
+        ):
+            base = values[0]
+            deltas = [_delta(v, base, higher_is_better=better) for v in values]
+            out.append(row(label, deltas))
+
+    if show_bars and downloads and max(downloads) > 0:
+        best = max(downloads)
+        out.append("")
+        out.append(style.paint(f"{'':<{label_w}}Download, relative to best",
+                                "dim"))
         for t, v in zip(titles, downloads, strict=False):
-            frac = (v / best) if best else 0
-            bar = "█" * int(round(frac * 18)) or "·"
+            frac = v / best
+            bar = "█" * max(1, int(round(frac * 20)))
             out.append(f"{'':<{label_w}}{t[:col_w - 1]:<{col_w}}"
-                       f"{style.paint(bar, 'accent')} "
-                       f"{v:.1f} Mbit/s")
+                       f"{style.paint(bar, 'accent')} {v:.1f} Mbit/s")
 
     return "\n".join(out)
 
