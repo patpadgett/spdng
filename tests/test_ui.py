@@ -415,3 +415,30 @@ def test_shorten_never_returns_something_longer():
     for width in range(2, 30):
         out = _shorten("A Very Long Sponsor Name Indeed", width)
         assert len(out) <= width
+
+
+def test_the_version_is_the_same_everywhere():
+    """The package, the CLI and the packaging metadata must agree.
+
+    They drifted once: the package said 0.1.0, the CLI said 0.3.0 and
+    pyproject said something else. A tool that reports three different
+    versions of itself looks unmaintained, which is the one thing this
+    tool is not supposed to look like.
+    """
+    import re
+    from pathlib import Path
+
+    import spdng
+    from spdng.cli import __version__ as cli_version
+
+    assert spdng.__version__ == cli_version
+
+    root = Path(spdng.__file__).parent.parent
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        text = pyproject.read_text()
+        match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+        assert match, "could not find the version in pyproject.toml"
+        assert match.group(1) == spdng.__version__, (
+            f"pyproject says {match.group(1)}, the package says "
+            f"{spdng.__version__}")
