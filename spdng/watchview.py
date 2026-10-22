@@ -217,12 +217,8 @@ class WatchView:
             assert all(len(r[0]) == spark_width for r in up_rows), \
                 "the upload chart is not the right width"
 
-            # A row is: 2 indent + spark + 1 space + 8 value = 11 +
-            # spark_width, then a 4-space gap before the second half.
-            row_width = spark_width + 11
-            # The gap between the halves is exactly the space the
-            # second half's indent does not fill, so the two sparks
-            # start at the same offset.
+            # A row is: 2 indent + spark + 1 space + 7 for the value,
+            # then a 4-space gap before the second half.
             # The headings sit over the sparks, which start at column
             # 2 of each half.
             # The headings sit over the sparks. The first spark starts

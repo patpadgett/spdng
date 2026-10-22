@@ -283,6 +283,10 @@ Both the live trace and the watch view respond to keys:
 | `r` | save a human-readable report |
 | `space` | pause and resume |
 | `+` / `-` | change the interval between rounds |
+| `u` | show or hide the upload chart (watch view) |
+
+The keyboard is answered while the work is running, so `q` quits
+immediately instead of after the current sample finishes.
 
 Reports go to `~/.local/share/spdng/reports` by default, or wherever
 `--save-dir` says. `spdng speedtest` also takes `--csv` for stdout,
@@ -291,22 +295,28 @@ Reports go to `~/.local/share/spdng/reports` by default, or wherever
 ### The watch graph
 
 `spdng watch` draws a live bar graph per metric, scaled against the best
-sample in the session, plus a vertical chart of download over time. Ping is
-drawn inverted, so a tall bar always means a problem rather than always
+sample in the session, plus a time-based chart of download over time. Ping
+is drawn inverted, so a tall bar always means a problem rather than always
 meaning a good number.
+
+The view fills the terminal it was given: the chart takes the full width
+and its height grows to fill whatever is left over. Resize the terminal
+and the layout follows.
+
+Press `u` to show or hide the upload chart. With it on, the two charts
+sit side by side and the download chart takes half the width; with it off,
+the download chart takes the whole width. The upload *stat bar* at the top
+is always shown - that is the current upload rate, which is worth seeing.
 
 ```
   Download
     peak         256.0 Mbit/s   last     190.0   avg     175.0
     ████████████████████████████████████████████████░░░░░░░░░░░░░░░░   190.0 Mbit/s
 
-  Download over time
-            █         ▄       256.0
-            █   █   █ █       224.0
-  █ █      ▄█   █▄█ █▄█  ▄    192.0
-  █ ██  █ ███▄▄ ███████▄ █    160.0
-  █▄██▄▄█▄█████▄██████████    128.0
-  ████████████████████████     96.0
+  Download over time                                 Upload over time
+  ▄                ▄         ▄     █      256.0         █▄    ▄     12.9
+  █                █  ▄      █     ██     241.5    █     █    █▄ █   █
+  ██         ▄     █  █ ▄    █     ██     227.1    █   ▄▄█ █  ██▄█   █
 ```
 
 ### Colour
@@ -505,16 +515,23 @@ SPDNG_LIVE=1 .venv/bin/python -m pytest -m live -q
 ```
 
 The test suite covers degenerate input, network failure, environment
-limits, output contracts, and the process itself. It is organised in five
-files: `test_spdng.py` for the core, `test_fun.py` for the extras,
-`test_edge_cases.py` for the things that actually go wrong,
-`test_history.py` for the local history file, and `test_ui.py` for the
-tables and the live view.
+limits, output contracts, and the process itself:
 
-`test_ui.py` has the alignment tests, which are the ones worth keeping:
-every line of every table must have the same visible width, with and
-without colour, in every box style. That is the test that would have
-caught the original misalignment.
+| file | what it covers |
+|---|---|
+| `test_spdng.py` | the core: measurement, providers, the CLI |
+| `test_edge_cases.py` | the things that actually go wrong |
+| `test_ui.py` | the tables and the live view |
+| `test_curses_colour.py` | the curses colour path and the streaming trace |
+| `test_watchview.py` | the watch charts and the layout at any width |
+| `test_httpconn.py` | the persistent connection and warm latency |
+| `test_fun.py` | the extras |
+| `test_history.py` | the local history file |
+
+`test_ui.py` and `test_curses_colour.py` have the alignment tests, which
+are the ones worth keeping: every line of every table must have the same
+visible width, with and without colour, in every box style. That is the
+test that would have caught the original misalignment.
 
 ## License
 
