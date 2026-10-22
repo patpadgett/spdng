@@ -7,6 +7,7 @@ ourselves, and we rank by distance first.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import urllib.error
@@ -61,7 +62,7 @@ class Server:
         """
         if not self.host:
             return ""
-        return f"http://{self.host}/speedtest"
+        return f"http://{format_host_port(self.host)}/speedtest"
 
     def to_dict(self) -> dict:
         return {
@@ -78,6 +79,57 @@ class Server:
             "jitter_ms": self.jitter_ms,
             "loss_pct": self.loss_pct,
         }
+
+
+def split_host_port(value: str, default_port: int | None = None) -> tuple[str, int | None]:
+    """Split a URL, host:port, or bare host into (hostname, port).
+
+    This is deliberately not ``value.split(":")``. That works for
+    ``example.com:8080`` and fails for every IPv6 address (and for a URL
+    with a scheme). ``urlsplit`` knows about bracketed IPv6 literals and
+    userinfo, and a bare IPv6 address is recognised before URL parsing so
+    ``2001:db8::1`` is not mistaken for a host and port.
+
+    ``default_port`` is used when the value carries no port and has no
+    scheme. An http or https URL supplies its own default (80 or 443).
+    """
+    raw = value.strip()
+    if not raw:
+        return "", default_port
+
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError:
+        address = None
+    if address is not None:
+        return str(address), default_port
+
+    parsed = urllib.parse.urlsplit(
+        raw if "://" in raw else f"//{raw}")
+    host = parsed.hostname
+    if not host:
+        return raw, default_port
+    port = parsed.port
+    if port is None:
+        if parsed.scheme == "https":
+            port = 443
+        elif parsed.scheme == "http":
+            port = 80
+        else:
+            port = default_port
+    return host, port
+
+
+def format_host_port(host: str, port: int | None = None) -> str:
+    """Render a host for a URL or a display, bracketing IPv6 literals."""
+    if not host.startswith("["):
+        try:
+            is_v6 = ipaddress.ip_address(host).version == 6
+        except ValueError:
+            is_v6 = False
+        if is_v6:
+            host = f"[{host}]"
+    return f"{host}:{port}" if port is not None else host
 
 
 def _get(url: str, ua: str = DEFAULT_UA, timeout: int = 20) -> bytes:

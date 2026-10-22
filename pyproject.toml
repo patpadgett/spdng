@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "spdng"
-version = "0.7.0"
+version = "0.8.0"
 description = "A maintained speedtest CLI with mtr-style path analysis"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,11 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: System :: Networking :: Monitoring",
 ]
@@ -30,7 +35,7 @@ Repository = "https://github.com/patpadgett/spdng"
 Issues = "https://github.com/patpadgett/spdng/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.4"]
+dev = ["pytest>=7", "pyte>=0.8", "ruff>=0.4"]
 
 [[project.authors]]
 name = "Patrick Padgett"

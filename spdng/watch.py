@@ -17,6 +17,8 @@ from .measure import SpeedTestResult
 
 
 def _clear_line() -> None:
+    if not sys.stdout.isatty():
+        return
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
 
@@ -30,25 +32,34 @@ def render_watch_frame(results: list[SpeedTestResult], interval: float,
         dl = latest.download_mbps
         up = latest.upload_mbps
         ping = latest.latency.avg_ms
+        dl_text = f"{dl:>7.1f}" if dl is not None else f"{'n/a':>7}"
+        up_text = f"{up:>6.1f}" if up is not None else f"{'n/a':>6}"
         parts.append(
-            f"{style.paint(f'{dl:>7.1f}', 'good')} Mbit/s down  "
-            f"{style.paint(f'{up:>6.1f}', 'ok')} Mbit/s up  "
-            f"ping {style.paint(f'{ping:>6.1f}', 'value') if ping else '   n/a'} ms"
+            f"{style.paint(dl_text, 'good')} Mbit/s down  "
+            f"{style.paint(up_text, 'ok')} Mbit/s up  "
+            f"ping {style.paint(f'{ping:>6.1f}', 'value') if ping is not None else '   n/a'} ms"
         )
         if len(results) > 1:
-            history = [r.download_mbps for r in results]
-            parts.append(f"  {fun.sparkline_history(history)}")
+            history = [r.download_mbps for r in results
+                       if r.download_mbps is not None]
+            if history:
+                parts.append(f"  {fun.sparkline_history(history)}")
     parts.append(style.paint(f"next in {next_in:.0f}s", "muted"))
     parts.append(style.paint("ctrl-c to stop", "muted"))
     return "  ".join(parts)
 
 
 def watch(run_once: Callable[[], SpeedTestResult], interval: float = 30.0,
-          duration: float = 0.0, clear: bool = True) -> list[SpeedTestResult]:
+          duration: float = 0.0, clear: bool = True,
+          show_frames: bool = True) -> list[SpeedTestResult]:
     """Run `run_once` on a loop, printing a live frame each time.
 
-    duration of 0 means run until interrupted.
+    duration of 0 means run until interrupted. A failed sample is reported
+    and retried after the interval; one bad cycle must not end a watch
+    session. `clear` only emits terminal escapes when stdout is a TTY, so
+    redirected output stays free of carriage returns and escape codes.
     """
+    clear = clear and sys.stdout.isatty()
     results: list[SpeedTestResult] = []
     started = time.perf_counter()
     try:
@@ -56,18 +67,32 @@ def watch(run_once: Callable[[], SpeedTestResult], interval: float = 30.0,
             if duration and (time.perf_counter() - started) >= duration:
                 break
             cycle_start = time.perf_counter()
-            result = run_once()
+            try:
+                result = run_once()
+            except Exception as exc:  # noqa: BLE001
+                print(f"spdng: watch sample failed: {exc}", file=sys.stderr)
+                elapsed_in_cycle = time.perf_counter() - cycle_start
+                sleep_for = max(0.0, interval - elapsed_in_cycle)
+                if duration:
+                    sleep_for = min(
+                        sleep_for,
+                        duration - (time.perf_counter() - started))
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                continue
+
             results.append(result)
             elapsed_in_cycle = time.perf_counter() - cycle_start
-            if clear:
-                _clear_line()
-            next_in = max(0.0, interval - elapsed_in_cycle)
-            frame = render_watch_frame(results, interval, next_in)
-            sys.stdout.write(frame + "\n")
-            sys.stdout.flush()
+            if show_frames:
+                if clear:
+                    _clear_line()
+                next_in = max(0.0, interval - elapsed_in_cycle)
+                frame = render_watch_frame(results, interval, next_in)
+                sys.stdout.write(frame + "\n")
+                sys.stdout.flush()
 
-            if clear:
-                _clear_line()
+                if clear:
+                    _clear_line()
             sleep_for = max(0.0, interval - elapsed_in_cycle)
             if duration:
                 sleep_for = min(sleep_for,
@@ -86,16 +111,21 @@ def render_watch_summary(results: list[SpeedTestResult]) -> str:
     """A summary of a watch session, once it ends."""
     if not results:
         return "no samples collected"
-    dls = [r.download_mbps for r in results]
+    dls = [r.download_mbps for r in results
+           if r.download_mbps is not None]
     pings = [r.latency.avg_ms for r in results if r.latency.avg_ms is not None]
     out: list[str] = []
     out.append(style.paint(f"{len(results)} samples", "heading"))
-    out.append(f"  download: min {min(dls):.1f}  max {max(dls):.1f}  "
-               f"avg {sum(dls) / len(dls):.1f} Mbit/s")
+    if dls:
+        out.append(f"  download: min {min(dls):.1f}  max {max(dls):.1f}  "
+                   f"avg {sum(dls) / len(dls):.1f} Mbit/s")
+    else:
+        out.append("  download: skipped")
     if pings:
         out.append(f"  ping    : min {min(pings):.1f}  max {max(pings):.1f}  "
                    f"avg {sum(pings) / len(pings):.1f} ms")
-    out.append(f"  {fun.sparkline_history(dls)}")
+    if dls:
+        out.append(f"  {fun.sparkline_history(dls)}")
     if len(dls) > 1:
         spread = (max(dls) - min(dls)) / max(min(dls), 0.1) * 100
         verdict = ("steady" if spread < 15 else

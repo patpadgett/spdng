@@ -5,6 +5,7 @@ Network tests are marked and skipped by default. Run them with:
 """
 from __future__ import annotations
 
+import socket
 import struct
 
 import pytest
@@ -183,6 +184,66 @@ def test_icmp_checksum_is_self_consistent():
     assert traceroute._checksum(full) == 0
 
 
+def _errqueue_cmsg(origin, icmp_type, icmp_code, offender,
+                   errno=113, family=socket.AF_INET):
+    if family == socket.AF_INET:
+        offender_addr = (struct.pack("=HH", family, 0)
+                         + socket.inet_aton(offender) + b"\x00" * 8)
+    else:
+        offender_addr = (struct.pack("=HHI", family, 0, 0)
+                         + socket.inet_pton(socket.AF_INET6, offender)
+                         + struct.pack("=I", 0))
+    return (struct.pack("=I4BII", errno, origin, icmp_type, icmp_code,
+                        0, 0, 0) + offender_addr)
+
+
+def test_router_address_comes_from_the_errqueue_offender():
+    cmsg = _errqueue_cmsg(
+        traceroute.SO_EE_ORIGIN_ICMP,
+        traceroute.ICMP_TIME_EXCEEDED, 0, "192.168.1.1")
+    assert traceroute._router_from_cmsg(cmsg) == "192.168.1.1"
+
+
+def test_ttl_expiry_is_not_destination_arrival():
+    cmsg = _errqueue_cmsg(
+        traceroute.SO_EE_ORIGIN_ICMP,
+        traceroute.ICMP_TIME_EXCEEDED, 0, "192.168.1.1")
+    router, reached = traceroute._recverr_outcome(cmsg, "1.1.1.1")
+    assert router == "192.168.1.1"
+    assert reached is False
+
+
+def test_port_unreachable_is_destination_arrival():
+    cmsg = _errqueue_cmsg(
+        traceroute.SO_EE_ORIGIN_ICMP,
+        traceroute.ICMP_DEST_UNREACH, traceroute.ICMP_PORT_UNREACH,
+        "1.1.1.1", errno=111)
+    router, reached = traceroute._recverr_outcome(cmsg, "1.1.1.1")
+    assert router == "1.1.1.1"
+    assert reached is True
+
+
+def test_malformed_errqueue_payload_is_not_arrival():
+    assert traceroute._recverr_outcome(b"short", "1.1.1.1") == (None, False)
+
+
+def test_udp_trace_uses_the_offender_and_keeps_tracing(monkeypatch):
+    calls = []
+
+    def fake_probe(host, port, ttl, timeout, target_ip=None):
+        calls.append(ttl)
+        return ("192.168.1.1", 1.0, False)
+
+    monkeypatch.setattr(traceroute, "_recverr_probe", fake_probe)
+    result = traceroute._trace_udp(
+        "1.1.1.1", 33434, max_hops=2, probes=1, timeout=0.1,
+        result=traceroute.TraceResult(target="1.1.1.1", method="udp"))
+
+    assert calls == [1, 2]
+    assert result.destination_reached is False
+    assert [hop.addr for hop in result.hops] == ["192.168.1.1", "192.168.1.1"]
+
+
 @pytest.mark.skipif(not traceroute.has_recverr(),
                     reason="IP_RECVERR is Linux-only")
 def test_recverr_probe_does_not_claim_arrival_on_local_refusal(monkeypatch):
@@ -262,22 +323,43 @@ def test_render_trace_has_mtr_style_columns():
 
 
 def test_render_loss_summary_flags_final_hop_loss():
-    t = traceroute.TraceResult(hops=[
-        traceroute.Hop(ttl=1, sent=3, received=3, rtts_ms=[5.0, 5.0, 5.0]),
-        traceroute.Hop(ttl=2, sent=3, received=1, rtts_ms=[9.0]),
-    ])
+    t = traceroute.TraceResult(
+        destination_reached=True,
+        hops=[
+            traceroute.Hop(ttl=1, sent=3, received=3,
+                           rtts_ms=[5.0, 5.0, 5.0]),
+            traceroute.Hop(ttl=2, sent=3, received=1, rtts_ms=[9.0]),
+        ])
     out = render.render_loss_summary(t)
     assert "lossy" in out
 
 
 def test_render_loss_summary_flags_latency_jump():
-    t = traceroute.TraceResult(hops=[
-        traceroute.Hop(ttl=1, sent=3, received=3, rtts_ms=[5.0, 5.0, 5.0]),
-        traceroute.Hop(ttl=2, sent=3, received=3, rtts_ms=[200.0, 200.0, 200.0]),
-    ])
+    t = traceroute.TraceResult(
+        destination_reached=True,
+        hops=[
+            traceroute.Hop(ttl=1, sent=3, received=3,
+                           rtts_ms=[5.0, 5.0, 5.0]),
+            traceroute.Hop(ttl=2, sent=3, received=3,
+                           rtts_ms=[200.0, 200.0, 200.0]),
+        ])
     out = render.render_loss_summary(t)
     assert "Latency jump" in out
     assert "hop 2" in out
+
+
+def test_render_loss_summary_does_not_call_an_unreached_hop_final():
+    t = traceroute.TraceResult(
+        target="192.0.2.1", destination_reached=False,
+        hops=[
+            traceroute.Hop(ttl=1, addr="10.0.0.1", sent=3, received=3,
+                           rtts_ms=[1.0, 1.0, 1.0]),
+            traceroute.Hop(ttl=2, sent=3, received=0),
+        ])
+    out = render.render_loss_summary(t)
+    assert "not reached" in out.lower()
+    assert "end-to-end latency" not in out.lower()
+    assert "0% loss" not in out
 
 
 def test_bar_renders():
@@ -391,6 +473,33 @@ def test_force_color_env_enables_colour(monkeypatch):
     style.set_color(None)
     assert style.color_enabled() is True
     assert "\033[" in style.paint("hello", "red")
+
+
+def test_raw_colour_names_are_not_theme_roles():
+    from spdng import style
+    style.set_color(True)
+    try:
+        assert style.paint("x", "red") == "\033[31mx\033[0m"
+        assert style.paint("x", "bold") == "\033[1mx\033[0m"
+    finally:
+        style.set_color(None)
+
+
+def test_an_unknown_style_role_is_left_alone():
+    from spdng import style
+    style.set_color(True)
+    try:
+        assert style.paint("x", "not-a-colour") == "x"
+    finally:
+        style.set_color(None)
+
+
+def test_the_correct_spdng_no_color_env_is_honoured(monkeypatch):
+    from spdng import style
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("SPDNG_NO_COLOR", "1")
+    style.set_color(None)
+    assert style.color_enabled() is False
 
 
 def test_no_color_beats_force_color(monkeypatch):

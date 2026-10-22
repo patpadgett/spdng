@@ -215,16 +215,19 @@ class LibreSpeedProvider(Provider):
 
         result = LatencyResult()
         url = self._endpoints(server)["ping"]
-        conn = LatencyConnection(url, ua=self.ua, timeout=timeout,
+        parts = urllib.parse.urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        endpoint = parts.path or "/empty.php"
+        conn = LatencyConnection(origin, ua=self.ua, timeout=timeout,
                                  validator=ok)
         try:
-            if conn.warm_up("/empty.php"):
+            if conn.warm_up(endpoint):
                 result.attempts += 1
             for i in range(count):
                 result.attempts += 1
                 stamp = int(time.time() * 1000)
                 try:
-                    rtt = conn.probe("/empty.php", f"{stamp}.{i}")
+                    rtt = conn.probe(endpoint, f"{stamp}.{i}")
                     result.samples_ms.append(rtt)
                 except ProbeError:
                     result.errors += 1

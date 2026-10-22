@@ -15,10 +15,13 @@ Two things this module gets right that the old tool does not:
 """
 from __future__ import annotations
 
+import http.client
 import os
 import ssl
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -47,7 +50,9 @@ class LatencyResult:
     def loss_pct(self) -> float:
         if not self.attempts:
             return 100.0
-        return self.errors * 100.0 / self.attempts
+        # Keep the percentage meaningful even if a provider reports a
+        # setup error separately from its probe attempts.
+        return min(max(self.errors, 0), self.attempts) * 100.0 / self.attempts
 
     @property
     def avg_ms(self) -> float | None:
@@ -95,8 +100,11 @@ class ThroughputResult:
 @dataclass(slots=True)
 class SpeedTestResult:
     server: object = None
-    download_mbps: float = 0.0
-    upload_mbps: float = 0.0
+    #: None means the direction was not measured (for example because the
+    #: user passed --no-download). It is deliberately different from 0.0,
+    #: which is a real transfer that moved no bytes.
+    download_mbps: float | None = None
+    upload_mbps: float | None = None
     latency: LatencyResult = field(default_factory=LatencyResult)
     download_detail: ThroughputResult = field(default_factory=ThroughputResult)
     upload_detail: ThroughputResult = field(default_factory=ThroughputResult)
@@ -112,14 +120,19 @@ class SpeedTestResult:
             "server": srv,
             "provider": self.provider,
             "provider_label": self.provider_label,
-            "download_mbps": round(self.download_mbps, 2),
-            "upload_mbps": round(self.upload_mbps, 2),
+            "download_mbps": (round(self.download_mbps, 2)
+                              if self.download_mbps is not None else None),
+            "upload_mbps": (round(self.upload_mbps, 2)
+                            if self.upload_mbps is not None else None),
             "latency": {
                 "avg_ms": self.latency.avg_ms,
                 "min_ms": self.latency.min_ms,
                 "max_ms": self.latency.max_ms,
                 "jitter_ms": self.latency.jitter_ms,
-                "loss_pct": round(self.latency.loss_pct, 1),
+                # No attempts means the latency probe was skipped, not
+                # that every probe failed. Do not turn that into 100% loss.
+                "loss_pct": (round(self.latency.loss_pct, 1)
+                             if self.latency.attempts else None),
                 "samples_ms": [round(s, 2) for s in self.latency.samples_ms],
             },
             "download": {
@@ -148,47 +161,133 @@ def _opener(ua: str) -> urllib.request.OpenerDirector:
 
 
 
+_WORKER_LOCK = threading.Lock()
+
+
+def _count(counter: list[int], byte_count: int) -> None:
+    """Add a worker's bytes under the lock shared by all transfer threads."""
+    with _WORKER_LOCK:
+        counter[0] += byte_count
+
+
+def _error(errors: list[int]) -> None:
+    with _WORKER_LOCK:
+        errors[0] += 1
+
+
+def _cache_busted(url: str, sequence: int) -> str:
+    """Add a fresh query parameter so a repeated URL is not served from cache."""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    query.append(("spdng", str(sequence)))
+    return urllib.parse.urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urllib.parse.urlencode(query), parts.fragment,
+    ))
+
+
 def download_worker(url: str, ua: str, stop_at: float,
                     counter: list[int], errors: list[int],
                     chunk_size: int = 65536) -> None:
-    """Stream a URL until `stop_at`, counting bytes.
+    """Download from `url` repeatedly until `stop_at`, counting bytes.
 
-    Shared by every provider: they differ in the URL, not in how the
-    transfer is counted.
+    A single request is not a throughput test: a small file ends in
+    milliseconds and a large one can end before the window does. Keep
+    issuing requests (with a fresh cache-buster) until the deadline, and
+    count every byte read before it. A response that ends early is
+    followed by another request; an error ends this worker.
     """
     opener = _opener(ua)
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": ua, "Accept": "*/*", "Connection": "close"})
-        with opener.open(req, timeout=30) as resp:
-            while time.perf_counter() < stop_at:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                counter[0] += len(chunk)
-    except (urllib.error.URLError, OSError, ssl.SSLError, ValueError):
-        errors[0] += 1
+    sequence = 0
+    while time.perf_counter() < stop_at:
+        target = _cache_busted(url, sequence)
+        sequence += 1
+        received = 0
+        try:
+            req = urllib.request.Request(target, headers={
+                "User-Agent": ua, "Accept": "*/*"})
+            with opener.open(req, timeout=30) as resp:
+                while time.perf_counter() < stop_at:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    _count(counter, len(chunk))
+        except (urllib.error.URLError, OSError, ssl.SSLError, ValueError):
+            _error(errors)
+            return
+        if received == 0:
+            # A request that was still in flight when the window closed
+            # has simply run out of time; that is not a transfer error.
+            if time.perf_counter() >= stop_at:
+                return
+            # An empty 200 response would otherwise spin as fast as the
+            # CPU allows without measuring anything.
+            _error(errors)
+            return
+
+
+def _upload_connection(url: str, timeout: float = 30.0):
+    """A persistent HTTP(S) connection for the upload worker."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(
+            parts.hostname, parts.port or 443, timeout=timeout,
+            context=ssl.create_default_context())
+    if parts.scheme == "http":
+        return http.client.HTTPConnection(
+            parts.hostname, parts.port or 80, timeout=timeout)
+    raise ValueError(f"unsupported upload scheme: {parts.scheme!r}")
+
+
+def _upload_path(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path or "/"
+    return f"{path}?{parts.query}" if parts.query else path
 
 
 def upload_worker(url: str, ua: str, stop_at: float,
                   counter: list[int], errors: list[int],
                   chunk_size: int = 1 << 16) -> None:
-    """POST random bytes to a URL until `stop_at`, counting bytes."""
-    opener = _opener(ua)
+    """POST random bytes until `stop_at`, reusing one connection.
+
+    Opening a fresh connection for every 64 KiB chunk measures the TCP
+    and TLS handshake, not the upload. Keep the connection open and send
+    the chunks back-to-back; if the server closes it between requests,
+    reconnect once and continue.
+    """
+    path = _upload_path(url)
+    conn = None
     try:
         while time.perf_counter() < stop_at:
             payload = os.urandom(chunk_size)
-            req = urllib.request.Request(
-                url, data=payload, headers={
-                    "User-Agent": ua,
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(len(payload)),
-                })
-            with opener.open(req, timeout=30) as resp:
-                resp.read()
-                counter[0] += len(payload)
-    except (urllib.error.URLError, OSError, ssl.SSLError, ValueError):
-        errors[0] += 1
+            for attempt in (0, 1):
+                try:
+                    if conn is None:
+                        conn = _upload_connection(url)
+                    conn.request("POST", path, body=payload, headers={
+                        "User-Agent": ua,
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(len(payload)),
+                    })
+                    resp = conn.getresponse()
+                    resp.read()
+                    if not 200 <= resp.status < 300:
+                        raise OSError(
+                            f"upload returned HTTP {resp.status}")
+                    _count(counter, len(payload))
+                    break
+                except (http.client.HTTPException, OSError, ssl.SSLError,
+                        ValueError):
+                    if conn is not None:
+                        conn.close()
+                    conn = None
+                    if attempt == 1:
+                        _error(errors)
+                        return
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

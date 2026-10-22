@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import socket
 import sys
 import time
+import urllib.parse
 
 from . import (
     compare,
@@ -60,6 +63,26 @@ def _set_origin(provider, args) -> None:
 
 def _pick_server(provider, args) -> tuple[servers.Server | None, str | None]:
     """Pick the server to test against."""
+    # A URL means "use this exact server", which is how you point at a
+    # LibreSpeed instance you run yourself. Do this before asking the
+    # provider for its public list: a custom instance is often the reason
+    # the list endpoint is unreachable in the first place.
+    if args.server and args.server.lower().startswith(("http://", "https://")):
+        url = args.server.rstrip("/")
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.hostname:
+            return None, f"invalid server URL: {args.server!r}"
+        try:
+            host = servers.format_host_port(
+                parsed.hostname, parsed.port)
+        except ValueError as exc:
+            return None, f"invalid server URL: {exc}"
+        return servers.Server(
+            id="custom", host=host, sponsor="Custom", name=url,
+            country="", cc="", lat=0.0, lon=0.0, distance_km=0.0,
+            url=url, provider=provider.id,
+        ), None
+
     _set_origin(provider, args)
     candidates = provider.list_servers(limit=max(10, args.limit))
 
@@ -72,16 +95,6 @@ def _pick_server(provider, args) -> tuple[servers.Server | None, str | None]:
             if (needle in s.host.lower() or needle in s.name.lower()
                     or needle in s.sponsor.lower()):
                 return s, None
-        # A URL means "use this exact server", which is how you point at a
-        # LibreSpeed instance you run yourself.
-        if args.server.lower().startswith(("http://", "https://")):
-            url = args.server.rstrip("/")
-            host = url.split("//", 1)[-1].split("/")[0]
-            return servers.Server(
-                id="custom", host=host, sponsor="Custom", name=url,
-                country="", cc="", lat=0.0, lon=0.0, distance_km=0.0,
-                url=url, provider=provider.id,
-            ), None
         return None, f"no server matched {args.server!r}"
 
     if args.max_distance > 0:
@@ -98,15 +111,16 @@ def _run_one(provider, server, args, *, do_trace: bool):
     result.provider = provider.id
     result.provider_label = provider.label
 
-    result.latency = provider.measure_latency(
-        server, count=args.latency_samples)
-    server.latency_ms = result.latency.avg_ms
-    server.jitter_ms = result.latency.jitter_ms
+    if not args.no_latency:
+        result.latency = provider.measure_latency(
+            server, count=args.latency_samples)
+        server.latency_ms = result.latency.avg_ms
+        server.jitter_ms = result.latency.jitter_ms
 
-    if result.latency.avg_ms is None:
-        result.errors.append(
-            "latency probe failed against every server; "
-            "the server may require a browser session")
+        if result.latency.avg_ms is None:
+            result.errors.append(
+                "latency probe failed against every server; "
+                "the server may require a browser session")
 
     if not args.no_download:
         result.download_detail = provider.measure_download(
@@ -120,18 +134,51 @@ def _run_one(provider, server, args, *, do_trace: bool):
 
     trace = None
     if do_trace:
-        host = server.host.split(":")[0]
-        port = int(server.host.split(":")[1]) if ":" in server.host else 8080
-        try:
-            target_ip = socket.gethostbyname(host)
-        except OSError:
-            target_ip = host
+        host, port = _server_trace_endpoint(server)
         trace = traceroute.traceroute(
-            target_ip, port=port, max_hops=args.max_hops,
+            host, port=port, max_hops=args.max_hops,
             probes=args.trace_probes, timeout=args.trace_timeout)
         result.errors.extend(_trace_notes(trace))
 
     return result, trace
+
+
+def _server_trace_endpoint(server) -> tuple[str, int]:
+    """The host and UDP port to use when tracing to a selected server.
+
+    A server's endpoint can be a URL (LibreSpeed), a host:port pair, or a
+    bare hostname. Parsing it as text and splitting on ':' breaks bracketed
+    IPv6 addresses and ignores the scheme's default port, so use the
+    endpoint URL when the provider gave us one and fall back to the host.
+    """
+    # `host` is the canonical endpoint, while `url` is often a legacy
+    # redirect target. Prefer a port explicitly carried by host, then use
+    # the service URL for a bare host (where the scheme supplies 443/80).
+    host_value = getattr(server, "host", "")
+    endpoints = getattr(server, "endpoints", {}) or {}
+    candidates = (
+        getattr(server, "url", ""),
+        endpoints.get("ping"),
+        endpoints.get("download"),
+        getattr(server, "base", ""),
+    )
+    if host_value:
+        try:
+            host, port = servers.split_host_port(host_value)
+            if host and port is not None:
+                return host, port
+        except ValueError:
+            pass
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            host, port = servers.split_host_port(value)
+        except ValueError:
+            continue
+        if host:
+            return host, port if port is not None else 80
+    return host_value, 80
 
 
 def _trace_notes(trace) -> list[str]:
@@ -141,6 +188,19 @@ def _trace_notes(trace) -> list[str]:
     if not trace.hops:
         notes.append("traceroute: no hops probed")
     return notes
+
+
+def _trace_exit_code(trace) -> int:
+    """A trace that could not produce a path is not a success.
+
+    Shell callers need to distinguish "here is the path" from "tracing
+    failed" and "the destination never answered". A partial path with a
+    method error or an unreachable destination exits 1; resolution errors
+    are handled separately with exit 2.
+    """
+    if trace.error or not trace.hops or not trace.destination_reached:
+        return 1
+    return 0
 
 
 def cmd_speedtest(args) -> int:
@@ -195,20 +255,39 @@ def cmd_speedtest(args) -> int:
 
 
 def _write_report(result, args, provider) -> str:
-    """Write a result to a file, in the format the extension asks for."""
-    import os
-    if args.save_dir:
-        os.makedirs(args.save_dir, exist_ok=True)
-        base = args.save_dir
+    """Write a result to the exact path requested by ``--save``.
+
+    The extension chooses the format. A path with no extension gets
+    ``.txt``. When the requested path is a directory, or when only a bare
+    filename is given with ``--save-dir``, generate a timestamped name
+    inside that directory instead of throwing the requested name away.
+    """
+    requested = os.path.expanduser(args.save)
+    suffix = os.path.splitext(requested)[1]
+    ext = suffix.lstrip(".").lower() or "txt"
+    directory = args.save_dir
+    if directory:
+        directory = os.path.expanduser(directory)
+
+    target_is_dir = os.path.isdir(requested) or requested.endswith(os.sep)
+    if target_is_dir:
+        target_dir = (os.path.join(directory, requested)
+                      if directory and not os.path.isabs(requested)
+                      else requested)
+        filename = f"result-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+        path = os.path.join(target_dir, filename)
     else:
-        xdg = os.environ.get("XDG_DATA_HOME")
-        root = xdg if xdg else os.path.join(os.path.expanduser("~"),
-                                           ".local", "share")
-        base = os.path.join(root, "spdng", "reports")
-        os.makedirs(base, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    ext = os.path.splitext(args.save)[1].lstrip(".") or "txt"
-    path = os.path.join(base, f"result-{stamp}.{ext}")
+        if not suffix:
+            requested += ".txt"
+        if directory and not os.path.isabs(requested):
+            path = os.path.join(directory, requested)
+        else:
+            path = requested
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     if ext == "csv":
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(frames.result_to_csv(result))
@@ -251,7 +330,12 @@ def cmd_compare(args) -> int:
         if trace is not None:
             traces[provider.id] = trace
 
-    good = [r for r in results if r is not None]
+    good = []
+    good_titles = []
+    for result, title in zip(results, titles, strict=False):
+        if result is not None:
+            good.append(result)
+            good_titles.append(title)
     if not good:
         print("spdng: every provider failed", file=sys.stderr)
         return 1
@@ -259,7 +343,7 @@ def cmd_compare(args) -> int:
     if args.json:
         payload = {
             "results": [r.to_dict() for r in good],
-            "providers": titles,
+            "providers": good_titles,
         }
         if traces:
             payload["traces"] = {k: v.to_dict() for k, v in traces.items()}
@@ -267,7 +351,7 @@ def cmd_compare(args) -> int:
         return 0
 
     print()
-    print(compare.render_comparison(good, titles))
+    print(compare.render_comparison(good, good_titles))
     print()
     for pid, trace in traces.items():
         print(style.paint(f"Path to {pid}", "heading"))
@@ -342,24 +426,38 @@ def cmd_servers(args) -> int:
 
 def cmd_trace(args) -> int:
     _apply_style(args)
-    host = args.target
     try:
-        ip = socket.gethostbyname(host)
+        host, port = servers.split_host_port(args.target)
+    except ValueError as exc:
+        print(f"spdng: invalid trace target {args.target!r}: {exc}",
+              file=sys.stderr)
+        return 2
+    if not host:
+        print(f"spdng: invalid trace target {args.target!r}", file=sys.stderr)
+        return 2
+    if args.port is not None and not 1 <= args.port <= 65535:
+        print("spdng: --port must be between 1 and 65535", file=sys.stderr)
+        return 2
+    try:
+        ip, _family = traceroute.resolve_address(host)
     except OSError as exc:
         print(f"spdng: cannot resolve {host}: {exc}", file=sys.stderr)
         return 2
 
-    port = args.port
+    if args.port is not None:
+        port = args.port
     if port is None:
-        for proto in ("https", "http"):
+        for candidate in (443, 80):
             try:
-                with socket.create_connection(
-                        (ip, 443 if proto == "https" else 80), timeout=5):
-                    port = 443 if proto == "https" else 80
+                with socket.create_connection((ip, candidate), timeout=5):
+                    port = candidate
                     break
             except OSError:
                 continue
         port = port or 80
+    if port is not None and not 1 <= port <= 65535:
+        print("spdng: --port must be between 1 and 65535", file=sys.stderr)
+        return 2
 
     # mtr shows each hop the moment it is measured, not after the whole
     # path is done. So the traceroute hands us each hop as it lands and
@@ -371,7 +469,7 @@ def cmd_trace(args) -> int:
             ip, port=port, max_hops=args.max_hops, probes=args.probes,
             timeout=args.timeout, method=args.method)
         print(json.dumps(trace.to_dict(), indent=2))
-        return 0
+        return _trace_exit_code(trace)
 
     return _stream_trace(ip, port, args)
 
@@ -413,7 +511,10 @@ def _trace_row(hop, columns) -> str:
         role = "good"
 
     def ms(value):
-        return f"{value:.2f} ms" if value is not None else "---"
+        if value is None:
+            return "---"
+        prefix = "~" if hop.rtt_approximate else ""
+        return f"{prefix}{value:.2f} ms"
 
     values = {
         "Hop": f"{hop.ttl}",
@@ -432,6 +533,16 @@ def _trace_row(hop, columns) -> str:
     return " " + " ".join(
         pad(values.get(title, ""), width, align)
         for title, width, align in columns)
+
+
+def _print_trace_tail(trace) -> None:
+    """Print the verdict after a streaming trace, including its error."""
+    print()
+    summary = render.render_loss_summary(trace)
+    if trace.error and trace.error not in summary:
+        print(style.paint(f"  {trace.error}", "bad"))
+    print(summary)
+    print()
 
 
 def _stream_trace_plain(ip: str, port: int, args, columns) -> int:
@@ -456,10 +567,8 @@ def _stream_trace_plain(ip: str, port: int, args, columns) -> int:
         ip, port=port, max_hops=args.max_hops, probes=args.probes,
         timeout=args.timeout, method=args.method, on_hop=on_hop)
 
-    print()
-    print(render.render_loss_summary(trace))
-    print()
-    return 0
+    _print_trace_tail(trace)
+    return _trace_exit_code(trace)
 
 
 def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
@@ -483,10 +592,8 @@ def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
             ip, port=port, max_hops=args.max_hops, probes=args.probes,
             timeout=args.timeout, method=args.method, on_hop=on_hop)
 
-    print()
-    print(render.render_loss_summary(trace))
-    print()
-    return 0
+    _print_trace_tail(trace)
+    return _trace_exit_code(trace)
 
 
 def cmd_doctor(args) -> int:
@@ -509,13 +616,15 @@ def cmd_doctor(args) -> int:
     if has_ping:
         print(f"    -> startup overhead: "
               f"{traceroute._ping_startup_overhead():.1f} ms (calibrated)")
-    if raw:
-        method = "icmp (raw socket)"
-    elif has_ping:
-        method = "ping (via CAP_NET_RAW ping binary)"
-    else:
-        method = "udp (IP_RECVERR)"
-    print(f"  traceroute method     : {method}")
+    labels = {
+        "icmp": "icmp (raw socket)",
+        "icmp-dgram": "icmp (unprivileged datagram socket)",
+        "ping": "ping (via CAP_NET_RAW ping binary)",
+        "udp": "udp (IP_RECVERR)",
+    }
+    method = traceroute.choose_method("127.0.0.1")
+    print(f"  traceroute method     : "
+          f"{labels.get(method, 'none available')}")
     print(f"  colour                : "
           f"{'on' if style.color_enabled() else 'off'}"
           f"  (theme: {style.theme().name})")
@@ -557,8 +666,11 @@ def cmd_watch(args) -> int:
         return result
 
     if args.plain:
-        results = watch.watch(run_once, interval=args.interval,
-                               duration=args.watch_duration)
+        results = watch.watch(
+            run_once, interval=args.interval,
+            duration=args.watch_duration,
+            clear=sys.stdout.isatty(),
+            show_frames=not args.json)
         if not results:
             return 1
         if args.json:
@@ -633,7 +745,11 @@ def _watch_curses(run_once, provider, server, args) -> int:
                 if kind == "error":
                     view.set_status("error", str(payload))
                     busy = False
-                    break
+                    # Retry after the normal interval rather than
+                    # exiting the watch session on one transient
+                    # failure.
+                    next_run = time.time() + interval
+                    continue
                 result = payload
                 busy = False
                 sample = WatchSample(
@@ -688,8 +804,6 @@ def _watch_curses(run_once, provider, server, args) -> int:
 
             if args.watch_duration and (time.time() - started) >= args.watch_duration:
                 break
-            if view.status == "error":
-                break
 
             # Start the next sample when it is due, and only if one is
             # not already running. The sample runs on its own thread,
@@ -715,8 +829,8 @@ def _result_from_sample(sample):
     r.download_mbps = sample.download_mbps
     r.upload_mbps = sample.upload_mbps
     r.latency = measure.LatencyResult(
-        samples_ms=[sample.ping_ms] if sample.ping_ms else [], errors=0,
-        attempts=1)
+        samples_ms=[sample.ping_ms] if sample.ping_ms is not None else [],
+        errors=0, attempts=1)
     return r
 
 
@@ -747,18 +861,26 @@ def cmd_history(args) -> int:
     for e in entries[-args.show:]:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.timestamp))
         ping = f"{e.ping_ms:6.1f} ms" if e.ping_ms is not None else "     n/a"
+        down = (style.paint(f"{e.download_mbps:>8.2f}", "good")
+                if e.download_mbps is not None
+                else style.paint(f"{'n/a':>8}", "muted"))
+        up = (style.paint(f"{e.upload_mbps:>6.2f}", "ok")
+              if e.upload_mbps is not None
+              else style.paint(f"{'n/a':>6}", "muted"))
         print(f"  {when}  {e.provider:<12} "
-              f"{style.paint(f'{e.download_mbps:>8.2f}', 'good')} Mbit/s down  "
-              f"{style.paint(f'{e.upload_mbps:>6.2f}', 'ok')} Mbit/s up  "
-              f"ping {ping}")
+              f"{down} Mbit/s down  {up} Mbit/s up  ping {ping}")
 
     t = history.trend(entries)
     print()
-    downloads = [e.download_mbps for e in entries]
-    print(f"  {style.paint('range', 'dim')}: "
-          f"{t['download_min']:.1f} .. {t['download_max']:.1f} Mbit/s "
-          f"(avg {t['download_avg']:.1f})")
-    print(f"  {fun.sparkline_history(downloads)}")
+    downloads = [e.download_mbps for e in entries
+                 if e.download_mbps is not None]
+    if "download_min" in t:
+        print(f"  {style.paint('range', 'dim')}: "
+              f"{t['download_min']:.1f} .. {t['download_max']:.1f} Mbit/s "
+              f"(avg {t['download_avg']:.1f})")
+        print(f"  {fun.sparkline_history(downloads)}")
+    else:
+        print(f"  {style.paint('range', 'dim')}: no download measurements")
     if "change_pct" in t:
         change = t["change_pct"]
         role = "good" if change >= 0 else "bad"
@@ -782,7 +904,7 @@ def cmd_live(args) -> int:
     _apply_style(args)
     return live.run_live_trace(
         args.target,
-        port=args.port or 33434,
+        port=args.port,
         max_hops=args.max_hops,
         interval=args.interval,
         rounds=args.rounds,
@@ -802,24 +924,44 @@ def cmd_moo(args) -> int:
     return 0
 
 
+def _add_global_options(parser: argparse.ArgumentParser,
+                        *, suppress_defaults: bool = False) -> None:
+    """Add the options that apply to every subcommand.
+
+    The same options are registered on each subparser so they work before
+    or after the command name. On the child parsers the defaults are
+    suppressed: otherwise an absent child flag would overwrite the value
+    the parent parser already parsed.
+    """
+    default = argparse.SUPPRESS if suppress_defaults else False
+    parser.add_argument("--version", action="version",
+                        version=f"spdng {__version__}")
+    parser.add_argument("--no-color", action="store_true", default=default,
+                        help="disable colour output (also honours NO_COLOR)")
+    parser.add_argument("--color", action="store_true", default=default,
+                        help="force colour output even when piped")
+    parser.add_argument("--theme", choices=sorted(style.THEMES),
+                        default=(argparse.SUPPRESS if suppress_defaults
+                                 else "default"),
+                        help="colour theme")
+    parser.add_argument("--no-fun", action="store_true", default=default,
+                        help="no grades, no speedometer, no wisecracks")
+    parser.add_argument("--no-history", action="store_true", default=default,
+                        help="do not record this result to the local history")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="spdng",
         description="A maintained speedtest CLI with mtr-style path analysis.",
     )
-    p.add_argument("--version", action="version",
-                   version=f"spdng {__version__}")
-    p.add_argument("--no-color", action="store_true",
-                   help="disable colour output (also honours NO_COLOR)")
-    p.add_argument("--color", action="store_true",
-                   help="force colour output even when piped")
-    p.add_argument("--theme", choices=sorted(style.THEMES), default="default",
-                   help="colour theme")
-    p.add_argument("--no-fun", action="store_true",
-                   help="no grades, no speedometer, no wisecracks")
-    p.add_argument("--no-history", action="store_true",
-                   help="do not record this result to the local history")
+    _add_global_options(p)
     sub = p.add_subparsers(dest="command", required=True)
+
+    def add_subparser(name: str, **kwargs) -> argparse.ArgumentParser:
+        sp = sub.add_parser(name, **kwargs)
+        _add_global_options(sp, suppress_defaults=True)
+        return sp
 
     def add_common(sp):
         sp.add_argument("--json", action="store_true",
@@ -855,30 +997,30 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-hops", type=int, default=20)
         sp.add_argument("-v", "--verbose", action="store_true")
 
-    sp = sub.add_parser("speedtest", help="run a bandwidth test")
+    sp = add_subparser("speedtest", help="run a bandwidth test")
     add_common(sp)
     sp.set_defaults(func=cmd_speedtest)
 
-    sp = sub.add_parser("compare",
-                         help="test against several providers and line them up")
+    sp = add_subparser("compare",
+                        help="test against several providers and line them up")
     add_common(sp)
     sp.add_argument("--providers", nargs="+",
                     default=["ookla", "cloudflare", "librespeed"],
                     help="which providers to compare")
     sp.set_defaults(func=cmd_compare)
 
-    sp = sub.add_parser("repeat",
-                         help="run the same test several times to see the spread")
+    sp = add_subparser("repeat",
+                        help="run the same test several times to see the spread")
     add_common(sp)
     sp.add_argument("--count", type=int, default=3,
                     help="how many times to run the test")
     sp.set_defaults(func=cmd_repeat)
 
-    sp = sub.add_parser("servers", help="list candidate servers, nearest first")
+    sp = add_subparser("servers", help="list candidate servers, nearest first")
     add_common(sp)
     sp.set_defaults(func=cmd_servers)
 
-    sp = sub.add_parser("live", help="live mtr-style traceroute, updating in place")
+    sp = add_subparser("live", help="live mtr-style traceroute, updating in place")
     sp.add_argument("target", nargs="?", default="1.1.1.1")
     sp.add_argument("--port", type=int, default=None)
     sp.add_argument("--max-hops", type=int, default=20)
@@ -887,25 +1029,29 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--rounds", type=int, default=0,
                     help="stop after N rounds (0 = until you quit)")
     sp.add_argument("--timeout", type=float, default=2.0)
-    sp.add_argument("--method", choices=["auto", "icmp", "udp"], default="auto")
+    sp.add_argument("--method",
+                    choices=["auto", "icmp", "icmp-dgram", "ping", "udp"],
+                    default="auto")
     sp.add_argument("--save-dir", default=None,
                     help="where to save reports (default: the data dir)")
     sp.set_defaults(func=cmd_live)
 
-    sp = sub.add_parser("trace", help="mtr-style traceroute to a host")
+    sp = add_subparser("trace", help="mtr-style traceroute to a host")
     sp.add_argument("target")
     sp.add_argument("--port", type=int, default=None)
     sp.add_argument("--max-hops", type=int, default=20)
     sp.add_argument("--probes", type=int, default=3)
     sp.add_argument("--timeout", type=float, default=2.0)
-    sp.add_argument("--method", choices=["auto", "icmp", "udp"], default="auto")
+    sp.add_argument("--method",
+                    choices=["auto", "icmp", "icmp-dgram", "ping", "udp"],
+                    default="auto")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_trace)
 
-    sp = sub.add_parser("doctor", help="check what this environment supports")
+    sp = add_subparser("doctor", help="check what this environment supports")
     sp.set_defaults(func=cmd_doctor)
 
-    sp = sub.add_parser("watch", help="re-test on a timer and show a trend")
+    sp = add_subparser("watch", help="re-test on a timer and show a trend")
     add_common(sp)
     sp.add_argument("--interval", type=float, default=30.0,
                     help="seconds between tests")
@@ -915,7 +1061,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="plain text output instead of the curses view")
     sp.set_defaults(func=cmd_watch)
 
-    sp = sub.add_parser("history", help="show past measurements and the trend")
+    sp = add_subparser("history", help="show past measurements and the trend")
     sp.add_argument("--limit", type=int, default=200,
                     help="how many history entries to load")
     sp.add_argument("--show", type=int, default=10,
@@ -925,16 +1071,53 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_history)
 
-    sp = sub.add_parser("moo", help="moo")
+    sp = add_subparser("moo", help="moo")
     sp.add_argument("text", nargs="*", help="what the cow should say")
     sp.set_defaults(func=cmd_moo)
 
     return p
 
 
+def _validation_error(args) -> str | None:
+    """Reject nonsensical numeric options before touching the network."""
+    positive = [
+        ("duration", "--duration"),
+        ("threads", "--threads"),
+        ("latency_samples", "--latency-samples"),
+        ("limit", "--limit"),
+        ("trace_probes", "--trace-probes"),
+        ("count", "--count"),
+        ("show", "--show"),
+        ("max_hops", "--max-hops"),
+        ("interval", "--interval"),
+        ("timeout", "--timeout"),
+        ("trace_timeout", "--trace-timeout"),
+    ]
+    for attr, flag in positive:
+        value = getattr(args, attr, None)
+        if value is None:
+            continue
+        if not math.isfinite(value) or value <= 0:
+            return f"{flag} must be a positive finite number"
+    for attr, flag in (("max_distance", "--max-distance"),
+                       ("rounds", "--rounds"),
+                       ("watch_duration", "--watch-duration")):
+        value = getattr(args, attr, None)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            return f"{flag} must be zero or a positive finite number"
+    port = getattr(args, "port", None)
+    if port is not None and not 1 <= port <= 65535:
+        return "--port must be between 1 and 65535"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    error = _validation_error(args)
+    if error:
+        print(f"spdng: {error}", file=sys.stderr)
+        return 2
     try:
         return args.func(args)
     except KeyboardInterrupt:

@@ -8,11 +8,19 @@ worth toggling.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from spdng import style
 from spdng.table import visible_width
-from spdng.watchview import WatchSample, WatchView
+from spdng.watchview import (
+    WatchSample,
+    WatchView,
+    save_csv,
+    save_json,
+    save_report,
+)
 
 
 def _chart_rows_in(lines: list[str]) -> list[str]:
@@ -84,7 +92,7 @@ def test_the_download_chart_is_always_there():
 # the layout
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("width", [60, 80, 100, 120, 160, 200])
+@pytest.mark.parametrize("width", [40, 48, 60, 80, 100, 120, 160, 200])
 def test_the_view_fits_the_width(width):
     """A line wider than the terminal wraps and corrupts the layout."""
     for upload in (True, False):
@@ -256,3 +264,22 @@ def test_with_colour_the_width_is_unchanged():
     plain = _view().render_lines(100, 30)
     assert [visible_width(line) for line in coloured] == \
         [visible_width(line) for line in plain]
+
+
+def test_a_missing_ping_is_saved_as_missing_not_zero(tmp_path):
+    sample = WatchSample(
+        timestamp=1000.0, download_mbps=100.0, upload_mbps=10.0,
+        ping_ms=None, provider="ookla", server="Example")
+    csv_path = tmp_path / "watch.csv"
+    json_path = tmp_path / "watch.json"
+    report_path = tmp_path / "watch.txt"
+
+    save_csv([sample], str(csv_path))
+    save_json([sample], str(json_path))
+    save_report([sample], str(report_path), "Example")
+
+    assert csv_path.read_text().splitlines()[-1].endswith(
+        ",100.000,10.000,")
+    assert json.loads(json_path.read_text())["samples"][0]["ping_ms"] is None
+    report_line = report_path.read_text().splitlines()[-1]
+    assert report_line.endswith("n/a")

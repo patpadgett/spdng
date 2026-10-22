@@ -10,6 +10,7 @@ from collections.abc import Sequence
 
 from . import style
 from .measure import SpeedTestResult
+from .table import pad
 
 
 def _shorten(text: str, width: int) -> str:
@@ -65,6 +66,10 @@ def render_comparison(results: Sequence[SpeedTestResult],
 
     n = len(results)
     titles = list(titles) if titles else [f"#{i + 1}" for i in range(n)]
+    if len(titles) < n:
+        titles.extend(f"#{i + 1}" for i in range(len(titles), n))
+    elif len(titles) > n:
+        titles = titles[:n]
 
     # Layout: the numeric rows live in strict columns so they line up and
     # can be compared at a glance. The server details get their own lines,
@@ -75,7 +80,10 @@ def render_comparison(results: Sequence[SpeedTestResult],
     label_w = 11
 
     def row(label: str, values: list[str]) -> str:
-        cells = "".join(f"{v:<{col_w}}" for v in values)
+        # Visible-width padding, not len(): a coloured value would
+        # otherwise lose its trailing spaces and shift every later
+        # column left by the length of the escape sequence.
+        cells = "".join(pad(v, col_w, "<") for v in values)
         return f"{label:<{label_w}}{cells}"
 
     header = "".join(f"{t[:col_w - 1]:<{col_w}}" for t in titles)
@@ -108,7 +116,8 @@ def render_comparison(results: Sequence[SpeedTestResult],
     uploads = [r.upload_mbps for r in results]
     pings = [r.latency.avg_ms for r in results]
     jitters = [r.latency.jitter_ms for r in results]
-    losses = [r.latency.loss_pct for r in results]
+    losses = [r.latency.loss_pct if r.latency.attempts else None
+              for r in results]
 
     out.append(row("Download", [
         style.paint(_fmt(v, "Mbit/s"), "good" if v and v > 10 else "value")
@@ -137,12 +146,15 @@ def render_comparison(results: Sequence[SpeedTestResult],
             deltas = [_delta(v, base, higher_is_better=better) for v in values]
             out.append(row(label, deltas))
 
-    if show_bars and downloads and max(downloads) > 0:
-        best = max(downloads)
+    known_downloads = [v for v in downloads if v is not None]
+    if show_bars and known_downloads and max(known_downloads) > 0:
+        best = max(known_downloads)
         out.append("")
         out.append(style.paint(f"{'':<{label_w}}Download, relative to best",
                                 "dim"))
         for t, v in zip(titles, downloads, strict=False):
+            if v is None:
+                continue
             frac = v / best
             bar = "█" * max(1, int(round(frac * 20)))
             out.append(f"{'':<{label_w}}{t[:col_w - 1]:<{col_w}}"
@@ -178,8 +190,11 @@ def render_repeat_comparison(runs: Sequence[SpeedTestResult],
                      "somewhat variable" if spread < 25 else "very variable")
         out.append(f"  {name}:")
         for i, v in enumerate(values):
+            if v is None:
+                out.append(f"    run {i + 1}: {'skipped':>10} {unit:<8}")
+                continue
             bar_val = ""
-            if v is not None and hi > lo:
+            if hi > lo:
                 bar_val = " " * int(round((v - lo) / (hi - lo) * 24))
             out.append(f"    run {i + 1}: {v:>10.2f} {unit:<8} "
                        f"{style.paint(bar_val, 'accent')}")

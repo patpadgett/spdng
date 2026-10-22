@@ -90,7 +90,10 @@ class CloudflareProvider(Provider):
 
         result = LatencyResult()
 
-        # The handshake, measured once, on its own.
+        # The handshake, measured once, on its own. Count the attempt even
+        # when it fails, so errors can never exceed attempts and loss_pct
+        # stays bounded.
+        result.attempts += 1
         start = time.perf_counter()
         try:
             sock = socket.create_connection(("speed.cloudflare.com", 443),

@@ -184,6 +184,44 @@ def test_watch_frame_shows_a_sparkline_after_two_samples():
     assert any(ch in frame for ch in fun.SPARK_CHARS)
 
 
+def test_watch_frame_shows_a_real_zero_ping():
+    frame = watch.render_watch_frame([_result(100.0, 0.0)], 30.0, 5.0)
+    assert "ping    0.0 ms" in frame
+
+
+def test_watch_does_not_clear_a_redirected_stream(capsys):
+    watch.style.set_color(False)
+    try:
+        results = watch.watch(
+            lambda: _result(), interval=0.01, duration=0.03, clear=True)
+    finally:
+        watch.style.set_color(None)
+
+    out = capsys.readouterr().out
+    assert results
+    assert "\r" not in out
+    assert "\033[K" not in out
+
+
+def test_watch_retries_after_a_failed_sample(capsys):
+    calls = []
+
+    def run_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("temporary network failure")
+        return _result()
+
+    results = watch.watch(
+        run_once, interval=0.01, duration=0.05, clear=False,
+        show_frames=False)
+
+    captured = capsys.readouterr()
+    assert len(calls) >= 2
+    assert results
+    assert "temporary network failure" in captured.err
+
+
 def test_watch_summary_of_no_samples():
     assert "no samples" in watch.render_watch_summary([])
 

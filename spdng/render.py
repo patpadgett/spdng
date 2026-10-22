@@ -52,9 +52,15 @@ def bar(fraction: float, width: int = 30, fill: str = "█", empty: str = "░")
     return fill * filled + empty * (width - filled)
 
 
-def format_speed(download_mbps: float, upload_mbps: float) -> str:
-    return (f"Download: {c(f'{download_mbps:.2f}', 'bold')} Mbit/s   "
-            f"Upload: {c(f'{upload_mbps:.2f}', 'bold')} Mbit/s")
+def _speed(value: float | None) -> str:
+    return f"{c(f'{value:.2f}', 'bold')} Mbit/s" if value is not None \
+        else c("skipped", "muted")
+
+
+def format_speed(download_mbps: float | None,
+                 upload_mbps: float | None) -> str:
+    return (f"Download: {_speed(download_mbps)}   "
+            f"Upload: {_speed(upload_mbps)}")
 
 
 def render_result(result: SpeedTestResult, show_server: bool = True,
@@ -75,12 +81,14 @@ def render_result(result: SpeedTestResult, show_server: bool = True,
         out.append(f"Ping: {c(f'{result.latency.avg_ms:.2f}', 'bold')} ms   "
                    f"jitter: {result.latency.jitter_ms:.2f} ms   "
                    f"loss: {result.latency.loss_pct:.0f}%")
+    elif result.latency.attempts == 0 and result.latency.errors == 0:
+        out.append("Ping: " + c("skipped", "muted"))
     else:
         out.append("Ping: " + c('unavailable', 'bold') +
                    "   (latency probe failed; not reporting a placeholder)")
     out.append(format_speed(result.download_mbps, result.upload_mbps))
 
-    if fun:
+    if fun and result.download_mbps is not None:
         out.append("")
         out.append(f"  {funmod.render_speedometer(result.download_mbps)}")
         out.append(f"  Grade: {funmod.render_grade(result.download_mbps)}"
@@ -142,6 +150,8 @@ def render_trace(trace: TraceResult, width: int = 30) -> str:
         if hop.rtt_approximate:
             last = f"~{hop.last_ms:.2f} ms" if hop.last_ms is not None else "---"
             avg = f"~{hop.avg_ms:.2f} ms" if hop.avg_ms is not None else "---"
+            best = f"~{hop.best_ms:.2f} ms" if hop.best_ms is not None else "---"
+            worst = f"~{hop.worst_ms:.2f} ms" if hop.worst_ms is not None else "---"
         out.append(
             f"{hop.ttl:>3}  {_hop_loss_color(hop)}  {hop.sent:>3}  "
             f"{last:>9}  {avg:>9}  {best:>9}  {worst:>9}  {jitter:>7}  {label}"
@@ -159,8 +169,25 @@ def render_trace(trace: TraceResult, width: int = 30) -> str:
 def render_loss_summary(trace: TraceResult) -> str:
     """Point at the first hop where loss or latency starts to climb.
 
-    This is the question mtr exists to answer.
+    This is the question mtr exists to answer. It is only meaningful when
+    the destination answered: a final hop that never replied is not the
+    end of the path, and its loss must not be presented as end-to-end
+    loss.
     """
+    if not trace.destination_reached:
+        lines = [c(
+            f"Destination NOT reached ({trace.target or 'unknown target'}); "
+            f"last-hop loss is not end-to-end loss", "bad")]
+        if trace.error:
+            lines.append(c(f"  {trace.error}", "bad"))
+        if trace.hops:
+            last = trace.hops[-1]
+            lines.append(c(
+                f"Last measured hop {last.ttl} "
+                f"({last.addr or 'no reply'}): "
+                f"{last.received}/{last.sent} replies", "muted"))
+        return "\n".join(lines)
+
     lines: list[str] = []
     prev_latency = None
     culprit = None
@@ -194,6 +221,8 @@ def render_loss_summary(trace: TraceResult) -> str:
         lines.append(c(
             f"No significant latency jump across the path; "
             f"end-to-end latency {final.avg_ms:.1f} ms", "good"))
+    if trace.error:
+        lines.append(c(f"  {trace.error}", "bad"))
     return "\n".join(lines)
 
 

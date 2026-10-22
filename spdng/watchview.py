@@ -26,8 +26,8 @@ class WatchSample:
     """One measurement in the watch session."""
 
     timestamp: float
-    download_mbps: float
-    upload_mbps: float
+    download_mbps: float | None
+    upload_mbps: float | None
     ping_ms: float | None
     provider: str = ""
     server: str = ""
@@ -85,25 +85,30 @@ class WatchView:
             rows.append("".join(line))
         return rows
 
-    def _stat_line(self, label: str, unit: str, peak: float, last: float,
-                   avg: float, width: int = 0) -> str:
+    def _stat_line(self, label: str, unit: str, peak: float | None,
+                   last: float | None, avg: float | None,
+                   width: int = 0) -> str:
         """A padded summary line, so the numbers sit under each other.
 
         The line is trimmed to fit the terminal: the "avg" field goes
         first, because peak and last are the numbers you read.
         """
         from .table import pad
+
+        def value(number: float | None) -> str:
+            return f"{number:>8.1f}" if number is not None else "     n/a"
+
         parts = [
-            f"    {pad('peak', 10)}{peak:>8.1f} {unit}",
-            f"   {pad('last', 6)}{last:>8.1f}",
-            f"   {pad('avg', 5)}{avg:>8.1f}",
+            f"    {pad('peak', 10)}{value(peak)} {unit}",
+            f"   {pad('last', 6)}{value(last)}",
+            f"   {pad('avg', 5)}{value(avg)}",
         ]
         line = parts[0]
         for extra in parts[1:]:
             if width and len(line) + len(extra) > width:
                 break
             line += extra
-        return line
+        return line[:width] if width else line
 
     def render_lines(self, width: int = 100, height: int = 0) -> list[str]:
         """The frame as a list of strings.
@@ -136,9 +141,12 @@ class WatchView:
         # truncates by one character each time never ends.)
         while len(f"{prefix}{target}   {stats}") > width and target:
             target = target[:-1]
-        out.append(style.paint(f"{prefix}{target}   {stats}", "heading"))
+        header = f"{prefix}{target}   {stats}"
+        if len(header) > width:
+            header = header[:width]
+        out.append(style.paint(header, "heading"))
         if self.message:
-            out.append(style.paint(f" {self.message}", "muted"))
+            out.append(style.paint(f" {self.message}"[:width], "muted"))
         out.append("")
 
         if not self.samples:
@@ -147,34 +155,46 @@ class WatchView:
             out.append(self._footer(width))
             return out
 
-        dls = [s.download_mbps for s in self.samples]
+        dls = [s.download_mbps for s in self.samples
+               if s.download_mbps is not None]
         pings = [s.ping_ms for s in self.samples if s.ping_ms is not None]
-        ups = [s.upload_mbps for s in self.samples]
-        peak_dl = max(dls) or 1
-        peak_up = max(ups) or 1
+        ups = [s.upload_mbps for s in self.samples
+               if s.upload_mbps is not None]
+        peak_dl = max(dls) if dls else None
+        peak_up = max(ups) if ups else None
         peak_ping = max(pings) if pings else 1
 
-        # The graph takes the whole width, less room for the label.
-        graph_width = max(20, width - 34)
+        # The graph leaves room for the indent, the current value, and
+        # the unit. Never force a 20-column bar onto a narrower terminal:
+        # that is how the stat bar used to overflow at 40 columns.
+        graph_width = max(1, min(60, width - 19))
 
         # Download bar graph
         out.append(style.paint("  Download", "heading"))
-        out.append(self._stat_line("Download", "Mbit/s", peak_dl, dls[-1],
-                                   sum(dls) / len(dls), width))
-        bar = self._bar(dls[-1], peak_dl, graph_width)
-        out.append("    " + style.paint(bar, "accent")
-                   + f" {dls[-1]:>7.1f} Mbit/s")
+        if dls:
+            out.append(self._stat_line(
+                "Download", "Mbit/s", peak_dl, dls[-1],
+                sum(dls) / len(dls), width))
+            bar = self._bar(dls[-1], peak_dl or 1, graph_width)
+            out.append("    " + style.paint(bar, "accent")
+                       + f" {dls[-1]:>7.1f} Mbit/s")
+        else:
+            out.append(style.paint("    skipped", "muted"))
         out.append("")
 
         # Upload stat bar. This always shows: it is the current upload
         # rate, which is worth seeing. The "u" key toggles the
         # TIME-BASED upload chart at the bottom, not this.
         out.append(style.paint("  Upload", "heading"))
-        out.append(self._stat_line("Upload", "Mbit/s", peak_up, ups[-1],
-                                   sum(ups) / len(ups), width))
-        bar = self._bar(ups[-1], peak_up, graph_width)
-        out.append("    " + style.paint(bar, "ok")
-                   + f" {ups[-1]:>7.1f} Mbit/s")
+        if ups:
+            out.append(self._stat_line(
+                "Upload", "Mbit/s", peak_up, ups[-1],
+                sum(ups) / len(ups), width))
+            bar = self._bar(ups[-1], peak_up or 1, graph_width)
+            out.append("    " + style.paint(bar, "ok")
+                       + f" {ups[-1]:>7.1f} Mbit/s")
+        else:
+            out.append(style.paint("    skipped", "muted"))
         out.append("")
 
         # Ping bar graph, inverted: lower is better, so we show "how bad is
@@ -201,10 +221,12 @@ class WatchView:
         out.append("")
         chart_height = self._chart_height(height, len(out) + 2)
 
-        if self.show_upload:
+        if self.show_upload and width >= 50:
             # Side by side. Each half gets an equal share of the width.
             # A half is: 2 spaces of indent, the spark, a space, and an
             # 8-character value, plus a 4-space gap between the halves.
+            # Below 50 columns that minimum does not fit, so the charts
+            # are stacked instead of being drawn past the right edge.
             half = max(24, (width - 4) // 2)
             spark_width = max(10, half - 11)
             dl_rows = self._chart_rows(dls, chart_height, spark_width)
@@ -219,13 +241,6 @@ class WatchView:
 
             # A row is: 2 indent + spark + 1 space + 7 for the value,
             # then a 4-space gap before the second half.
-            # The headings sit over the sparks, which start at column
-            # 2 of each half.
-            # The headings sit over the sparks. The first spark starts
-            # at column 2, and the second at column spark_width + 16.
-            # The upload spark starts at column spark_width + 16 in the
-            # data rows: 2 indent + spark + 1 space + 7 for the value
-            # + 4 gap + 2 indent. The heading goes there too.
             second_start = spark_width + 16
             out.append(
                 "  " + style.paint("Download over time", "heading")
@@ -243,15 +258,22 @@ class WatchView:
                 out.append(style.paint(left, "accent")
                            + "    " + style.paint(right, "ok"))
         else:
-            # On its own, the download chart takes the whole width.
-            spark_width = max(20, width - 11)
-            dl_rows = self._chart_rows(dls, chart_height, spark_width)
-            out.append(style.paint("  Download over time", "heading"))
-            for i in range(chart_height):
-                spark, value = dl_rows[i]
-                out.append(
-                    "  " + style.paint(spark.ljust(spark_width), "accent")
-                    + f" {value:>7.1f}")
+            # A full-width chart, either because upload is hidden or
+            # because two charts cannot fit side by side.
+            spark_width = max(1, width - 10)
+
+            def full_chart(values: list[float], title: str, role: str) -> None:
+                rows = self._chart_rows(values, chart_height, spark_width)
+                out.append(style.paint(f"  {title}"[:width], "heading"))
+                for spark, value in rows:
+                    line = (("  " + spark.ljust(spark_width))
+                            + f" {value:>7.1f}")
+                    out.append(style.paint(line[:width], role))
+
+            full_chart(dls, "Download over time", "accent")
+            if self.show_upload:
+                out.append("")
+                full_chart(ups, "Upload over time", "ok")
 
 
         out.append("")
@@ -350,7 +372,8 @@ def save_csv(samples: list[WatchSample], path: str) -> str:
                 f"{s.timestamp:.3f}",
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s.timestamp)),
                 s.provider, s.server,
-                f"{s.download_mbps:.3f}", f"{s.upload_mbps:.3f}",
+                f"{s.download_mbps:.3f}" if s.download_mbps is not None else "",
+                f"{s.upload_mbps:.3f}" if s.upload_mbps is not None else "",
                 f"{s.ping_ms:.3f}" if s.ping_ms is not None else "",
             ])
     return path
@@ -378,7 +401,8 @@ def save_json(samples: list[WatchSample], path: str) -> str:
 
 
 def save_report(samples: list[WatchSample], path: str, target: str) -> str:
-    dls = [s.download_mbps for s in samples]
+    dls = [s.download_mbps for s in samples
+           if s.download_mbps is not None]
     pings = [s.ping_ms for s in samples if s.ping_ms is not None]
     lines = [
         "spdng watch report",
@@ -398,10 +422,15 @@ def save_report(samples: list[WatchSample], path: str, target: str) -> str:
         ]
     lines += ["", "timestamp              download   upload   ping"]
     for s in samples:
+        down = f"{s.download_mbps:>8.2f}" if s.download_mbps is not None \
+            else f"{'n/a':>8}"
+        up = f"{s.upload_mbps:>6.2f}" if s.upload_mbps is not None \
+            else f"{'n/a':>6}"
+        ping = f"{s.ping_ms:>6.2f}" if s.ping_ms is not None \
+            else f"{'n/a':>6}"
         lines.append(
             f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s.timestamp))}"
-            f"  {s.download_mbps:>8.2f}  {s.upload_mbps:>6.2f}  "
-            f"{s.ping_ms if s.ping_ms is not None else 0:>6.2f}")
+            f"  {down}  {up}  {ping}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     return path

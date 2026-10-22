@@ -6,7 +6,7 @@ wrong silently misaligns every column after the first coloured one.
 """
 from __future__ import annotations
 
-from spdng import frames, style, table
+from spdng import compare, frames, measure, render, style, table
 from spdng.tui import (
     PROBE_ERROR,
     PROBE_OK,
@@ -242,6 +242,130 @@ def test_live_view_with_no_hops():
     assert lines
 
 
+def test_live_view_scrolls_the_visible_hop_window():
+    v = LiveTraceView("1.1.1.1")
+    for ttl in range(1, 13):
+        v.update_hop(ttl, f"host{ttl:02d}.example", 1.0, PROBE_OK, 1, 1)
+    # Six lines of chrome leave four hop rows on a ten-line screen.
+    v._screen_height = 10
+
+    v.scroll(5)
+    text = "\n".join(v.render_lines())
+    assert "host06.example" in text
+    assert "host09.example" in text
+    assert "host05.example" not in text
+    assert "host10.example" not in text
+
+    v.scroll(100)
+    v.render_lines()
+    assert v._scroll == 8
+    assert "host12.example" in "\n".join(v.render_lines())
+
+    v.scroll(-100)
+    v.render_lines()
+    assert v._scroll == 0
+    assert "host01.example" in "\n".join(v.render_lines())
+
+
+def test_live_trace_waits_between_probe_rounds(monkeypatch):
+    import time
+
+    from spdng import live
+
+    probe_times = []
+
+    class FakeScreen:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def size(self):
+            return 24, 80
+
+        def resized(self):
+            return False
+
+        def print_frame(self, lines):
+            pass
+
+        def getch(self, timeout):
+            return -1
+
+    def fake_probe(*args, **kwargs):
+        probe_times.append(time.monotonic())
+        return 1, "127.0.0.1", 1.0, live.PROBE_OK
+
+    monkeypatch.setattr(live, "Screen", FakeScreen)
+    monkeypatch.setattr(live, "probe_hop", fake_probe)
+
+    rc = live.run_live_trace(
+        "127.0.0.1", max_hops=1, interval=0.2, rounds=3, method="icmp")
+
+    assert rc == 0
+    assert len(probe_times) == 3
+    gaps = [b - a for a, b in zip(
+        probe_times, probe_times[1:], strict=False)]
+    assert all(gap >= 0.15 for gap in gaps), gaps
+
+
+def test_live_trace_pause_stops_new_probe_rounds(monkeypatch):
+    from spdng import live
+
+    probe_calls = []
+    state = {}
+
+    class FakeScreen:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def size(self):
+            return 24, 80
+
+        def resized(self):
+            return False
+
+        def print_frame(self, lines):
+            pass
+
+        def getch(self, timeout):
+            self.calls += 1
+            if self.calls == 2:
+                state["at_pause"] = len(probe_calls)
+                return ord(" ")
+            if self.calls >= 12:
+                return ord("q")
+            return -1
+
+    def fake_probe(*args, **kwargs):
+        probe_calls.append(1)
+        return 1, "127.0.0.1", 1.0, live.PROBE_OK
+
+    monkeypatch.setattr(live, "Screen", FakeScreen)
+    monkeypatch.setattr(live, "probe_hop", fake_probe)
+
+    rc = live.run_live_trace(
+        "127.0.0.1", max_hops=1, interval=0.05, rounds=0, method="icmp")
+
+    assert rc == 0
+    # A round already in flight when space is pressed may finish, but no
+    # new round starts while the view is paused.
+    assert state["at_pause"] <= 1
+    assert len(probe_calls) <= state["at_pause"] + 1
+
+
 def test_live_view_status_message():
     v = _view()
     v.set_status("paused", "waiting")
@@ -296,6 +420,27 @@ def test_result_table_without_latency():
     assert "1800000" not in out
 
 
+def test_skipped_download_is_not_a_fabricated_zero():
+    r = _result()
+    r.download_mbps = None
+    out = frames.result_table(r)
+    assert "skipped" in out.lower() or "n/a" in out.lower()
+    assert "on fire" not in out.lower()
+
+
+def test_skipped_directions_are_explicit_in_every_summary():
+    r = _result()
+    r.download_mbps = None
+    r.upload_mbps = None
+    r.latency = measure.LatencyResult()
+
+    assert "skipped" in render.render_result(r).lower()
+    assert "skipped" in frames.result_table(r).lower()
+    assert "not measured" in frames.result_to_csv(r)
+    assert "n/a" in compare.render_comparison([r, _result()], ["a", "b"])
+    assert "skipped" in compare.render_repeat_comparison([r, _result()])
+
+
 def test_result_csv_has_a_header_and_rows():
     csv_text = frames.result_to_csv(_result())
     lines = csv_text.strip().split("\n")
@@ -343,6 +488,19 @@ def test_trace_table_is_aligned():
     assert "ooo" in out
 
 
+def test_trace_table_marks_approximate_rtts():
+    style.set_color(False)
+    from spdng.traceroute import Hop, TraceResult
+
+    t = TraceResult(target="1.1.1.1", hops=[
+        Hop(ttl=1, addr="10.0.0.1", sent=3, received=3,
+            rtts_ms=[1.0, 2.0, 3.0], rtt_approximate=True),
+    ])
+    out = frames.trace_table(t)
+    assert "~1.00 ms" in out
+    assert "~2.00 ms" in out
+
+
 # --------------------------------------------------------------------------
 # the comparison view
 # --------------------------------------------------------------------------
@@ -381,6 +539,24 @@ def test_comparison_rows_line_up():
         # The label column is 11 wide, so every row's first data
         # character sits at the same offset.
         assert line[11] != " ", f"row is not indented to the label column: {line!r}"
+
+
+def test_comparison_rows_line_up_with_colour():
+    """Numbers must stay in their columns when colour is enabled."""
+    style.set_color(True)
+    try:
+        from spdng import compare
+        out = compare.render_comparison(
+            [_comp_result("A", 100.0, 20.0), _comp_result("B", 200.0, 30.0)],
+            ["one", "two"])
+        lines = out.split("\n")
+        header = next(line for line in lines if "one" in line and "two" in line)
+        target = table.visible_width(header)
+        for line in lines:
+            if line.startswith(("Download", "Upload", "Ping", "Jitter", "Loss")):
+                assert table.visible_width(line) == target, repr(line)
+    finally:
+        style.set_color(None)
 
 
 def test_comparison_server_row_is_one_line_per_provider():

@@ -17,6 +17,8 @@ import io
 import json
 import socket
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler
+from types import SimpleNamespace
 
 import pytest
 
@@ -152,6 +154,79 @@ def test_resolved_ip_tolerates_a_bad_host():
     assert traceroute._resolved_ip("this-host-does-not-exist.invalid")
 
 
+def test_split_host_port_handles_urls_and_ipv6():
+    from spdng.servers import format_host_port, split_host_port
+
+    assert split_host_port("example.com") == ("example.com", None)
+    assert split_host_port("example.com:8080") == ("example.com", 8080)
+    assert split_host_port("https://example.com/backend") == \
+        ("example.com", 443)
+    assert split_host_port("[2001:db8::1]:8443") == ("2001:db8::1", 8443)
+    assert split_host_port("2001:db8::1") == ("2001:db8::1", None)
+    assert split_host_port("https://[2001:db8::1]:8443/x") == \
+        ("2001:db8::1", 8443)
+    assert format_host_port("2001:db8::1", 8443) == "[2001:db8::1]:8443"
+
+
+def test_server_trace_endpoint_uses_the_endpoint_url_and_scheme_port():
+    from spdng import cli
+
+    server = SimpleNamespace(
+        host="[2001:db8::1]:8443",
+        url="https://[2001:db8::1]:8443/backend",
+        base="",
+        endpoints={},
+    )
+    assert cli._server_trace_endpoint(server) == ("2001:db8::1", 8443)
+
+    server = SimpleNamespace(
+        host="[2001:db8::1]", url="https://[2001:db8::1]/backend",
+        base="", endpoints={},
+    )
+    assert cli._server_trace_endpoint(server) == ("2001:db8::1", 443)
+
+    server = SimpleNamespace(
+        host="speed.example", url="", base="http://speed.example/speedtest",
+        endpoints={},
+    )
+    assert cli._server_trace_endpoint(server) == ("speed.example", 80)
+
+
+@pytest.mark.parametrize("port", ["0", "-1", "65536"])
+def test_invalid_ports_exit_before_tracing(port, capsys):
+    from spdng.cli import main
+
+    rc = main(["trace", "127.0.0.1", "--port", port])
+
+    assert rc == 2
+    assert "port" in capsys.readouterr().err.lower()
+
+
+def test_auto_uses_unprivileged_icmp_when_it_is_available(monkeypatch):
+    from spdng import traceroute as trace
+
+    monkeypatch.setattr(trace, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(trace, "has_unprivileged_icmp", lambda: True)
+    monkeypatch.setattr(trace, "has_ping_binary", lambda: True)
+    monkeypatch.setattr(trace, "has_recverr", lambda: True)
+    called = []
+
+    def fake_trace(host, max_hops, probes, timeout, result, on_hop=None):
+        called.append(host)
+        result.destination_reached = True
+        result.hops.append(trace.Hop(ttl=1, addr="127.0.0.1", sent=1,
+                                     received=1, rtts_ms=[1.0]))
+        return result
+
+    monkeypatch.setattr(trace, "_trace_dgram_icmp", fake_trace)
+
+    result = trace.traceroute("127.0.0.1", max_hops=1, probes=1,
+                              timeout=0.2, method="auto")
+
+    assert result.method == "icmp-dgram"
+    assert called == ["127.0.0.1"]
+
+
 def test_raw_icmp_probe_raises_cleanly_without_privileges():
     """On a box without CAP_NET_RAW this must fail, not crash the process."""
     if traceroute.has_raw_icmp():
@@ -199,7 +274,139 @@ def test_json_output_never_contains_ansi():
 def test_json_output_is_valid_for_an_empty_result():
     r = measure.SpeedTestResult(server=None)
     payload = r.to_dict()
-    assert json.loads(json.dumps(payload))["download_mbps"] == 0.0
+    assert json.loads(json.dumps(payload))["download_mbps"] is None
+
+
+def test_latency_loss_is_never_above_one_hundred_percent():
+    r = measure.LatencyResult(samples_ms=[], errors=5, attempts=3)
+    assert r.loss_pct == pytest.approx(100.0)
+
+
+def test_live_icmp_timeout_is_not_a_successful_probe(monkeypatch):
+    from spdng import live
+
+    monkeypatch.setattr(traceroute, "_raw_icmp_probe",
+                        lambda *args, **kwargs: (None, 2000.0))
+    _ttl, addr, rtt, outcome = live.probe_hop(
+        "192.0.2.1", 33434, 1, 2.0, "icmp")
+    assert outcome == live.PROBE_TIMEOUT
+    assert addr is None
+    assert rtt is None
+
+
+def test_live_udp_timeout_is_not_a_successful_probe(monkeypatch):
+    from spdng import live
+
+    monkeypatch.setattr(traceroute, "_recverr_probe",
+                        lambda *args, **kwargs: (None, 2000.0, False))
+    _ttl, addr, rtt, outcome = live.probe_hop(
+        "192.0.2.1", 33434, 1, 2.0, "udp")
+    assert outcome == live.PROBE_TIMEOUT
+    assert addr is None
+    assert rtt is None
+
+
+class _LiveScreen:
+    """A non-curses screen good enough for the live loop."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def size(self):
+        return 24, 80
+
+    def resized(self):
+        return False
+
+    def print_frame(self, lines):
+        pass
+
+    def getch(self, timeout):
+        return -1
+
+
+def test_live_uses_the_port_from_a_url_target(monkeypatch):
+    from spdng import live
+
+    ports = []
+    monkeypatch.setattr(live, "Screen", _LiveScreen)
+
+    def fake_probe(host, port, ttl, timeout):
+        ports.append(port)
+        return "127.0.0.1", 1.0, True
+
+    monkeypatch.setattr(live.traceroute, "_recverr_probe", fake_probe)
+
+    rc = live.run_live_trace(
+        "http://127.0.0.1:1234/backend", max_hops=1, rounds=1,
+        timeout=0.1, method="udp")
+
+    assert rc == 0
+    assert ports == [1234]
+
+
+def test_live_returns_failure_when_no_hop_answers(monkeypatch):
+    from spdng import live
+
+    monkeypatch.setattr(live, "Screen", _LiveScreen)
+    monkeypatch.setattr(
+        live.traceroute, "_recverr_probe",
+        lambda *args, **kwargs: (None, 0.1, False))
+
+    rc = live.run_live_trace(
+        "127.0.0.1", max_hops=1, rounds=1, timeout=0.1, method="udp")
+
+    assert rc == 1
+
+
+def test_live_without_a_tracing_method_exits_with_an_error(monkeypatch,
+                                                            capsys):
+    from spdng import live
+
+    monkeypatch.setattr(live.traceroute, "choose_method", lambda host: None)
+
+    rc = live.run_live_trace("127.0.0.1", rounds=1)
+
+    assert rc == 2
+    assert "no per-hop tracing method" in capsys.readouterr().err
+
+
+def test_cloudflare_handshake_failure_is_counted_as_an_attempt(monkeypatch):
+    from spdng.httpconn import ProbeError
+    from spdng.providers import cloudflare
+
+    def fail_connect(*args, **kwargs):
+        raise TimeoutError("no handshake")
+
+    monkeypatch.setattr(cloudflare.socket, "create_connection", fail_connect)
+
+    class FakeConnection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def warm_up(self, *args, **kwargs):
+            return False
+
+        def probe(self, *args, **kwargs):
+            raise ProbeError("no probe")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("spdng.httpconn.LatencyConnection",
+                        lambda *args, **kwargs: FakeConnection())
+    provider = cloudflare.CloudflareProvider()
+    result = provider.measure_latency(provider._server(), count=2, timeout=0.1)
+
+    assert result.attempts == 3
+    assert result.errors == 3
+    assert result.loss_pct == pytest.approx(100.0)
 
 
 def test_render_result_with_no_server():
@@ -274,6 +481,7 @@ def test_ping_binary_probe_without_ping(monkeypatch):
 def test_trace_falls_back_when_no_method_is_available(monkeypatch):
     """With no raw sockets, no ping, and no UDP, we must say so."""
     monkeypatch.setattr(traceroute, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(traceroute, "has_unprivileged_icmp", lambda: False)
     monkeypatch.setattr(traceroute, "has_ping_binary", lambda: False)
     monkeypatch.setattr(traceroute, "has_recverr", lambda: False)
     t = traceroute.traceroute("127.0.0.1", max_hops=1, probes=1, timeout=0.2)
@@ -286,6 +494,7 @@ def test_trace_falls_back_when_no_method_is_available(monkeypatch):
 def test_trace_falls_back_to_udp_when_the_others_are_missing(monkeypatch):
     """With no raw sockets and no ping, UDP is the last resort."""
     monkeypatch.setattr(traceroute, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(traceroute, "has_unprivileged_icmp", lambda: False)
     monkeypatch.setattr(traceroute, "has_ping_binary", lambda: False)
     monkeypatch.setattr(traceroute, "has_recverr", lambda: True)
     t = traceroute.traceroute("127.0.0.1", max_hops=1, probes=1, timeout=0.2)
@@ -339,6 +548,237 @@ def test_unknown_provider_exits_with_an_error():
     assert rc == 2
 
 
+@pytest.mark.parametrize("argv", [
+    ["speedtest", "--duration", "0"],
+    ["speedtest", "--threads", "0"],
+    ["speedtest", "--latency-samples", "0"],
+    ["speedtest", "--duration", "nan"],
+    ["speedtest", "--max-distance", "-1"],
+    ["watch", "--interval", "0"],
+])
+def test_invalid_numeric_options_exit_before_measuring(argv, capsys):
+    from spdng.cli import main
+
+    rc = main(argv)
+
+    assert rc == 2
+    assert "must be" in capsys.readouterr().err
+
+
+def test_no_latency_skips_the_latency_probe():
+    from spdng.cli import _run_one
+
+    class NeverCalledProvider:
+        id = "fake"
+        label = "Fake"
+
+        def measure_latency(self, *args, **kwargs):
+            raise AssertionError("latency should not be measured")
+
+    args = SimpleNamespace(
+        no_latency=True,
+        no_download=True,
+        no_upload=True,
+        latency_samples=5,
+        duration=1.0,
+        threads=1,
+    )
+
+    result, trace = _run_one(
+        NeverCalledProvider(), object(), args, do_trace=False)
+
+    assert trace is None
+    assert result.latency.attempts == 0
+    assert result.latency.errors == 0
+    assert result.download_mbps is None
+    assert result.upload_mbps is None
+
+
+def test_no_latency_is_rendered_as_skipped_not_failed():
+    from spdng import frames
+
+    result = measure.SpeedTestResult(server=None)
+    result.latency = measure.LatencyResult()
+
+    table = frames.result_table(result, fun_on=False)
+    plain = render.render_result(result)
+
+    assert "skipped" in table.lower()
+    assert "unavailable" not in table.lower()
+    assert "Ping: skipped" in plain
+    assert "not measured" in frames.result_to_csv(result)
+
+
+def test_no_latency_json_does_not_report_loss():
+    """Skipping the probe is not the same as every probe failing."""
+    result = measure.SpeedTestResult(server=None)
+    result.latency = measure.LatencyResult()
+
+    latency = result.to_dict()["latency"]
+
+    assert latency["avg_ms"] is None
+    assert latency["loss_pct"] is None
+    assert latency["samples_ms"] == []
+
+
+def test_save_uses_the_requested_filename(tmp_path):
+    from spdng.cli import _write_report
+
+    target = tmp_path / "nested" / "my-result.json"
+    args = SimpleNamespace(save=str(target), save_dir=None, no_fun=True)
+    result = measure.SpeedTestResult(server=None)
+    result.download_mbps = 42.0
+
+    path = _write_report(result, args, SimpleNamespace(id="fake"))
+
+    assert path == str(target)
+    assert target.is_file()
+    assert json.loads(target.read_text())["download_mbps"] == 42.0
+
+
+def test_save_dir_is_used_for_a_bare_filename(tmp_path):
+    from spdng.cli import _write_report
+
+    args = SimpleNamespace(save="custom.csv", save_dir=str(tmp_path),
+                           no_fun=True)
+    result = measure.SpeedTestResult(server=None)
+    result.download_mbps = 42.0
+
+    path = _write_report(result, args, SimpleNamespace(id="fake"))
+
+    assert path == str(tmp_path / "custom.csv")
+    assert "download,42.0000" in (tmp_path / "custom.csv").read_text()
+
+
+def test_save_without_an_extension_gets_txt(tmp_path):
+    from spdng.cli import _write_report
+
+    args = SimpleNamespace(save=str(tmp_path / "plain"), save_dir=None,
+                           no_fun=True)
+
+    path = _write_report(measure.SpeedTestResult(server=None), args,
+                         SimpleNamespace(id="fake"))
+
+    assert path == str(tmp_path / "plain.txt")
+    assert (tmp_path / "plain.txt").is_file()
+
+
+@pytest.mark.parametrize("argv", [
+    ["--no-color", "speedtest"],
+    ["speedtest", "--no-color"],
+    ["live", "1.1.1.1", "--no-color"],
+    ["history", "--no-color"],
+])
+def test_global_flags_work_before_or_after_a_subcommand(argv):
+    from spdng.cli import build_parser
+
+    args = build_parser().parse_args(argv)
+
+    assert args.no_color is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["--theme", "mono", "speedtest"],
+    ["speedtest", "--theme", "mono"],
+    ["trace", "1.1.1.1", "--theme", "mono"],
+])
+def test_theme_works_before_or_after_a_subcommand(argv):
+    from spdng.cli import build_parser
+
+    args = build_parser().parse_args(argv)
+
+    assert args.theme == "mono"
+
+
+def test_global_flags_keep_the_parent_value_when_not_repeated():
+    from spdng.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["--no-fun", "--no-history", "speedtest"])
+
+    assert args.no_fun is True
+    assert args.no_history is True
+
+
+def test_custom_server_url_skips_the_public_server_list(monkeypatch):
+    from spdng import cli
+
+    class Provider:
+        id = "librespeed"
+        label = "LibreSpeed"
+
+        def list_servers(self, limit=10):
+            raise AssertionError("public list should not be fetched")
+
+    monkeypatch.setattr(
+        cli, "_set_origin",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("origin lookup should not run")))
+    args = SimpleNamespace(
+        server="https://speed.example/backend/",
+        limit=20,
+        max_distance=0.0,
+    )
+
+    server, error = cli._pick_server(Provider(), args)
+
+    assert error is None
+    assert server is not None
+    assert server.host == "speed.example"
+    assert server.url == "https://speed.example/backend"
+    assert server.provider == "librespeed"
+
+
+def test_compare_keeps_titles_aligned_when_a_provider_fails(monkeypatch):
+    from spdng import cli
+
+    class FakeProvider:
+        def __init__(self, ident, label):
+            self.id = ident
+            self.label = label
+
+    bad = FakeProvider("bad", "Bad")
+    good = FakeProvider("good", "Good")
+
+    def get_provider(name):
+        return bad if name == "bad" else good
+
+    def pick_server(provider, args):
+        if provider is bad:
+            return None, "no server"
+        return object(), None
+
+    class FakeServer:
+        sponsor = "Sponsor"
+        name = "Server"
+        cc = "US"
+        distance_km = 1.0
+        provider = "fake"
+
+    result = measure.SpeedTestResult(server=FakeServer())
+    result.download_mbps = 10.0
+    result.upload_mbps = 1.0
+    result.latency = measure.LatencyResult(
+        samples_ms=[10.0], errors=0, attempts=1)
+
+    monkeypatch.setattr(cli.providers, "get_provider", get_provider)
+    monkeypatch.setattr(cli, "_pick_server", pick_server)
+    monkeypatch.setattr(cli, "_run_one",
+                        lambda *args, **kwargs: (result, None))
+    captured = []
+    monkeypatch.setattr(
+        cli.compare, "render_comparison",
+        lambda results, titles: captured.append((results, titles)) or "ok")
+
+    args = SimpleNamespace(providers=["bad", "good"], json=False,
+                           verbose=False, trace=False, no_color=True)
+    rc = cli.cmd_compare(args)
+
+    assert rc == 0
+    assert len(captured) == 1
+    assert captured[0][1] == ["Good"]
+
+
 def test_doctor_never_raises():
     from spdng.cli import main
     buf = io.StringIO()
@@ -388,6 +828,43 @@ def test_librespeed_join_handles_both_path_shapes():
         "https://h/backend/garbage.php"
     # trailing slashes
     assert _join("https://h/", "garbage.php") == "https://h/garbage.php"
+
+
+def test_librespeed_latency_uses_the_endpoint_path_once(http_server):
+    class PingHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        paths = []
+
+        def do_GET(self):  # noqa: N802
+            type(self).paths.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    from spdng.providers.librespeed import LibreSpeedProvider
+
+    PingHandler.paths = []
+    base = http_server(PingHandler)
+    endpoint = f"{base}/backend/empty.php"
+    srv = servers.Server(
+        id="local", host=base, sponsor="local", name="local", country="",
+        cc="", lat=0.0, lon=0.0, distance_km=0.0, url=base,
+        provider="librespeed",
+        endpoints={"download": f"{base}/backend/garbage.php",
+                   "upload": endpoint, "ping": endpoint})
+
+    result = LibreSpeedProvider().measure_latency(srv, count=3, timeout=2.0)
+
+    assert len(result.samples_ms) == 3
+    assert result.errors == 0
+    assert PingHandler.paths
+    assert all(path.startswith("/backend/empty.php?")
+               for path in PingHandler.paths)
+    assert not any("/empty.php/empty.php" in path
+                   for path in PingHandler.paths)
 
 
 def test_librespeed_coords_lookup():
