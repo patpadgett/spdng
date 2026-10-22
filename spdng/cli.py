@@ -13,6 +13,7 @@ import os
 import socket
 import sys
 import time
+import urllib.parse
 
 from . import (
     compare,
@@ -68,7 +69,14 @@ def _pick_server(provider, args) -> tuple[servers.Server | None, str | None]:
     # the list endpoint is unreachable in the first place.
     if args.server and args.server.lower().startswith(("http://", "https://")):
         url = args.server.rstrip("/")
-        host = url.split("//", 1)[-1].split("/")[0]
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.hostname:
+            return None, f"invalid server URL: {args.server!r}"
+        try:
+            host = servers.format_host_port(
+                parsed.hostname, parsed.port)
+        except ValueError as exc:
+            return None, f"invalid server URL: {exc}"
         return servers.Server(
             id="custom", host=host, sponsor="Custom", name=url,
             country="", cc="", lat=0.0, lon=0.0, distance_km=0.0,
@@ -126,18 +134,51 @@ def _run_one(provider, server, args, *, do_trace: bool):
 
     trace = None
     if do_trace:
-        host = server.host.split(":")[0]
-        port = int(server.host.split(":")[1]) if ":" in server.host else 8080
-        try:
-            target_ip = socket.gethostbyname(host)
-        except OSError:
-            target_ip = host
+        host, port = _server_trace_endpoint(server)
         trace = traceroute.traceroute(
-            target_ip, port=port, max_hops=args.max_hops,
+            host, port=port, max_hops=args.max_hops,
             probes=args.trace_probes, timeout=args.trace_timeout)
         result.errors.extend(_trace_notes(trace))
 
     return result, trace
+
+
+def _server_trace_endpoint(server) -> tuple[str, int]:
+    """The host and UDP port to use when tracing to a selected server.
+
+    A server's endpoint can be a URL (LibreSpeed), a host:port pair, or a
+    bare hostname. Parsing it as text and splitting on ':' breaks bracketed
+    IPv6 addresses and ignores the scheme's default port, so use the
+    endpoint URL when the provider gave us one and fall back to the host.
+    """
+    # `host` is the canonical endpoint, while `url` is often a legacy
+    # redirect target. Prefer a port explicitly carried by host, then use
+    # the service URL for a bare host (where the scheme supplies 443/80).
+    host_value = getattr(server, "host", "")
+    endpoints = getattr(server, "endpoints", {}) or {}
+    candidates = (
+        getattr(server, "url", ""),
+        endpoints.get("ping"),
+        endpoints.get("download"),
+        getattr(server, "base", ""),
+    )
+    if host_value:
+        try:
+            host, port = servers.split_host_port(host_value)
+            if host and port is not None:
+                return host, port
+        except ValueError:
+            pass
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            host, port = servers.split_host_port(value)
+        except ValueError:
+            continue
+        if host:
+            return host, port if port is not None else 80
+    return host_value, 80
 
 
 def _trace_notes(trace) -> list[str]:
@@ -147,6 +188,19 @@ def _trace_notes(trace) -> list[str]:
     if not trace.hops:
         notes.append("traceroute: no hops probed")
     return notes
+
+
+def _trace_exit_code(trace) -> int:
+    """A trace that could not produce a path is not a success.
+
+    Shell callers need to distinguish "here is the path" from "tracing
+    failed" and "the destination never answered". A partial path with a
+    method error or an unreachable destination exits 1; resolution errors
+    are handled separately with exit 2.
+    """
+    if trace.error or not trace.hops or not trace.destination_reached:
+        return 1
+    return 0
 
 
 def cmd_speedtest(args) -> int:
@@ -372,24 +426,38 @@ def cmd_servers(args) -> int:
 
 def cmd_trace(args) -> int:
     _apply_style(args)
-    host = args.target
     try:
-        ip = socket.gethostbyname(host)
+        host, port = servers.split_host_port(args.target)
+    except ValueError as exc:
+        print(f"spdng: invalid trace target {args.target!r}: {exc}",
+              file=sys.stderr)
+        return 2
+    if not host:
+        print(f"spdng: invalid trace target {args.target!r}", file=sys.stderr)
+        return 2
+    if args.port is not None and not 1 <= args.port <= 65535:
+        print("spdng: --port must be between 1 and 65535", file=sys.stderr)
+        return 2
+    try:
+        ip, _family = traceroute.resolve_address(host)
     except OSError as exc:
         print(f"spdng: cannot resolve {host}: {exc}", file=sys.stderr)
         return 2
 
-    port = args.port
+    if args.port is not None:
+        port = args.port
     if port is None:
-        for proto in ("https", "http"):
+        for candidate in (443, 80):
             try:
-                with socket.create_connection(
-                        (ip, 443 if proto == "https" else 80), timeout=5):
-                    port = 443 if proto == "https" else 80
+                with socket.create_connection((ip, candidate), timeout=5):
+                    port = candidate
                     break
             except OSError:
                 continue
         port = port or 80
+    if port is not None and not 1 <= port <= 65535:
+        print("spdng: --port must be between 1 and 65535", file=sys.stderr)
+        return 2
 
     # mtr shows each hop the moment it is measured, not after the whole
     # path is done. So the traceroute hands us each hop as it lands and
@@ -401,7 +469,7 @@ def cmd_trace(args) -> int:
             ip, port=port, max_hops=args.max_hops, probes=args.probes,
             timeout=args.timeout, method=args.method)
         print(json.dumps(trace.to_dict(), indent=2))
-        return 0
+        return _trace_exit_code(trace)
 
     return _stream_trace(ip, port, args)
 
@@ -500,7 +568,7 @@ def _stream_trace_plain(ip: str, port: int, args, columns) -> int:
         timeout=args.timeout, method=args.method, on_hop=on_hop)
 
     _print_trace_tail(trace)
-    return 0
+    return _trace_exit_code(trace)
 
 
 def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
@@ -525,7 +593,7 @@ def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
             timeout=args.timeout, method=args.method, on_hop=on_hop)
 
     _print_trace_tail(trace)
-    return 0
+    return _trace_exit_code(trace)
 
 
 def cmd_doctor(args) -> int:
@@ -548,13 +616,15 @@ def cmd_doctor(args) -> int:
     if has_ping:
         print(f"    -> startup overhead: "
               f"{traceroute._ping_startup_overhead():.1f} ms (calibrated)")
-    if raw:
-        method = "icmp (raw socket)"
-    elif has_ping:
-        method = "ping (via CAP_NET_RAW ping binary)"
-    else:
-        method = "udp (IP_RECVERR)"
-    print(f"  traceroute method     : {method}")
+    labels = {
+        "icmp": "icmp (raw socket)",
+        "icmp-dgram": "icmp (unprivileged datagram socket)",
+        "ping": "ping (via CAP_NET_RAW ping binary)",
+        "udp": "udp (IP_RECVERR)",
+    }
+    method = traceroute.choose_method("127.0.0.1")
+    print(f"  traceroute method     : "
+          f"{labels.get(method, 'none available')}")
     print(f"  colour                : "
           f"{'on' if style.color_enabled() else 'off'}"
           f"  (theme: {style.theme().name})")
@@ -834,7 +904,7 @@ def cmd_live(args) -> int:
     _apply_style(args)
     return live.run_live_trace(
         args.target,
-        port=args.port or 33434,
+        port=args.port,
         max_hops=args.max_hops,
         interval=args.interval,
         rounds=args.rounds,
@@ -959,7 +1029,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--rounds", type=int, default=0,
                     help="stop after N rounds (0 = until you quit)")
     sp.add_argument("--timeout", type=float, default=2.0)
-    sp.add_argument("--method", choices=["auto", "icmp", "udp"], default="auto")
+    sp.add_argument("--method",
+                    choices=["auto", "icmp", "icmp-dgram", "ping", "udp"],
+                    default="auto")
     sp.add_argument("--save-dir", default=None,
                     help="where to save reports (default: the data dir)")
     sp.set_defaults(func=cmd_live)
@@ -970,7 +1042,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-hops", type=int, default=20)
     sp.add_argument("--probes", type=int, default=3)
     sp.add_argument("--timeout", type=float, default=2.0)
-    sp.add_argument("--method", choices=["auto", "icmp", "udp"], default="auto")
+    sp.add_argument("--method",
+                    choices=["auto", "icmp", "icmp-dgram", "ping", "udp"],
+                    default="auto")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_trace)
 
@@ -1031,6 +1105,9 @@ def _validation_error(args) -> str | None:
         value = getattr(args, attr, None)
         if value is not None and (not math.isfinite(value) or value < 0):
             return f"{flag} must be zero or a positive finite number"
+    port = getattr(args, "port", None)
+    if port is not None and not 1 <= port <= 65535:
+        return "--port must be between 1 and 65535"
     return None
 
 

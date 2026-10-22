@@ -266,7 +266,7 @@ def test_the_streaming_trace_prints_errors(monkeypatch, capsys):
         "192.0.2.1", 33434, args, cli._trace_header())
     out = capsys.readouterr().out
 
-    assert rc == 0
+    assert rc == 1
     assert "no per-hop tracing method is available" in out
     assert "not reached" in out.lower()
 

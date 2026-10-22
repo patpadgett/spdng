@@ -23,9 +23,10 @@ Two things this shares with the old `speedtest-cli`, and does not:
 from __future__ import annotations
 
 import socket
+import sys
 import time
 
-from . import traceroute
+from . import servers, traceroute
 from .tui import (
     PROBE_ERROR,
     PROBE_OK,
@@ -69,12 +70,23 @@ def probe_hop(host: str, port: int, ttl: int, timeout: float,
             return ttl, None, None, PROBE_ERROR
         except OSError as exc:
             return ttl, None, None, _classify_error(exc)
+    if method in ("icmp-dgram", "dgram"):
+        try:
+            addr, rtt = traceroute._dgram_icmp_probe(
+                host, ttl, ttl, timeout)
+        except traceroute.TraceUnavailable:
+            return ttl, None, None, PROBE_ERROR
+        if addr is None:
+            return ttl, None, None, PROBE_TIMEOUT
+        return ttl, addr, rtt, PROBE_OK
     if method == "ping":
         addr, samples, _sent, _exact = traceroute._ping_binary_probe(
             host, ttl, timeout, 1)
         if addr:
             return ttl, addr, (samples[0] if samples else None), PROBE_OK
         return ttl, None, None, PROBE_TIMEOUT
+    if method != "udp":
+        return ttl, None, None, PROBE_ERROR
     # udp / IP_RECVERR
     addr, rtt, reached = traceroute._recverr_probe(host, port, ttl, timeout)
     if reached or addr:
@@ -82,29 +94,51 @@ def probe_hop(host: str, port: int, ttl: int, timeout: float,
     return ttl, None, None, PROBE_TIMEOUT
 
 
-def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
+def run_live_trace(target: str, port: int | None = None, max_hops: int = 20,
                    interval: float = 1.0, rounds: int = 0,
                    timeout: float = 2.0, method: str = "auto",
                    save_dir: str | None = None) -> int:
     """Run the live mtr-style trace until the user quits.
 
-    rounds of 0 means run forever.
+    rounds of 0 means run forever. A URL target supplies its own port when
+    the caller did not pass one.
     """
     try:
-        ip = socket.gethostbyname(target)
-    except OSError as exc:
+        host, target_port = servers.split_host_port(target)
+        ip, _family = traceroute.resolve_address(host)
+    except (OSError, ValueError) as exc:
         print(f"spdng: cannot resolve {target}: {exc}")
+        return 2
+    if port is None:
+        port = target_port if target_port is not None else 33434
+    if not 1 <= port <= 65535:
+        print("spdng: --port must be between 1 and 65535", file=sys.stderr)
         return 2
 
     if method == "auto":
-        if traceroute.has_raw_icmp():
-            method = "icmp"
-        elif traceroute.has_ping_binary():
-            method = "ping"
-        else:
-            method = "udp"
+        method = traceroute.choose_method(ip)
+        if method is None:
+            print(
+                "spdng: no per-hop tracing method is available here: "
+                "no raw or unprivileged ICMP sockets, no ping binary, "
+                "and no IP_RECVERR",
+                file=sys.stderr)
+            return 2
+    if method == "icmp" and _family == socket.AF_INET6:
+        print("spdng: raw ICMP tracing supports IPv4 only",
+              file=sys.stderr)
+        return 2
+    if (method == "icmp" and _family == socket.AF_INET
+            and not traceroute.has_raw_icmp()
+            and traceroute.has_unprivileged_icmp()
+            and traceroute.has_recverr()):
+        method = "icmp-dgram"
+    if method not in ("icmp", "icmp-dgram", "dgram", "ping", "udp"):
+        print(f"spdng: unknown traceroute method: {method}",
+              file=sys.stderr)
+        return 2
 
-    view = LiveTraceView(target)
+    view = LiveTraceView(host)
     sent: dict[int, int] = {}
     received: dict[int, int] = {}
     paused = False
@@ -253,6 +287,15 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
 
     stop.set()
     print()
+
+    received_any = any(hop["received"] > 0 for hop in view.hops)
+    reached = any(
+        hop["address"] and traceroute._is_target(ip, hop["address"])
+        for hop in view.hops)
+    if round_no and not received_any:
+        return 1
+    if rounds and not reached:
+        return 1
     return 0
 
 

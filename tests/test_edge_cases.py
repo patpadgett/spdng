@@ -154,6 +154,79 @@ def test_resolved_ip_tolerates_a_bad_host():
     assert traceroute._resolved_ip("this-host-does-not-exist.invalid")
 
 
+def test_split_host_port_handles_urls_and_ipv6():
+    from spdng.servers import format_host_port, split_host_port
+
+    assert split_host_port("example.com") == ("example.com", None)
+    assert split_host_port("example.com:8080") == ("example.com", 8080)
+    assert split_host_port("https://example.com/backend") == \
+        ("example.com", 443)
+    assert split_host_port("[2001:db8::1]:8443") == ("2001:db8::1", 8443)
+    assert split_host_port("2001:db8::1") == ("2001:db8::1", None)
+    assert split_host_port("https://[2001:db8::1]:8443/x") == \
+        ("2001:db8::1", 8443)
+    assert format_host_port("2001:db8::1", 8443) == "[2001:db8::1]:8443"
+
+
+def test_server_trace_endpoint_uses_the_endpoint_url_and_scheme_port():
+    from spdng import cli
+
+    server = SimpleNamespace(
+        host="[2001:db8::1]:8443",
+        url="https://[2001:db8::1]:8443/backend",
+        base="",
+        endpoints={},
+    )
+    assert cli._server_trace_endpoint(server) == ("2001:db8::1", 8443)
+
+    server = SimpleNamespace(
+        host="[2001:db8::1]", url="https://[2001:db8::1]/backend",
+        base="", endpoints={},
+    )
+    assert cli._server_trace_endpoint(server) == ("2001:db8::1", 443)
+
+    server = SimpleNamespace(
+        host="speed.example", url="", base="http://speed.example/speedtest",
+        endpoints={},
+    )
+    assert cli._server_trace_endpoint(server) == ("speed.example", 80)
+
+
+@pytest.mark.parametrize("port", ["0", "-1", "65536"])
+def test_invalid_ports_exit_before_tracing(port, capsys):
+    from spdng.cli import main
+
+    rc = main(["trace", "127.0.0.1", "--port", port])
+
+    assert rc == 2
+    assert "port" in capsys.readouterr().err.lower()
+
+
+def test_auto_uses_unprivileged_icmp_when_it_is_available(monkeypatch):
+    from spdng import traceroute as trace
+
+    monkeypatch.setattr(trace, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(trace, "has_unprivileged_icmp", lambda: True)
+    monkeypatch.setattr(trace, "has_ping_binary", lambda: True)
+    monkeypatch.setattr(trace, "has_recverr", lambda: True)
+    called = []
+
+    def fake_trace(host, max_hops, probes, timeout, result, on_hop=None):
+        called.append(host)
+        result.destination_reached = True
+        result.hops.append(trace.Hop(ttl=1, addr="127.0.0.1", sent=1,
+                                     received=1, rtts_ms=[1.0]))
+        return result
+
+    monkeypatch.setattr(trace, "_trace_dgram_icmp", fake_trace)
+
+    result = trace.traceroute("127.0.0.1", max_hops=1, probes=1,
+                              timeout=0.2, method="auto")
+
+    assert result.method == "icmp-dgram"
+    assert called == ["127.0.0.1"]
+
+
 def test_raw_icmp_probe_raises_cleanly_without_privileges():
     """On a box without CAP_NET_RAW this must fail, not crash the process."""
     if traceroute.has_raw_icmp():
@@ -231,6 +304,77 @@ def test_live_udp_timeout_is_not_a_successful_probe(monkeypatch):
     assert outcome == live.PROBE_TIMEOUT
     assert addr is None
     assert rtt is None
+
+
+class _LiveScreen:
+    """A non-curses screen good enough for the live loop."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def size(self):
+        return 24, 80
+
+    def resized(self):
+        return False
+
+    def print_frame(self, lines):
+        pass
+
+    def getch(self, timeout):
+        return -1
+
+
+def test_live_uses_the_port_from_a_url_target(monkeypatch):
+    from spdng import live
+
+    ports = []
+    monkeypatch.setattr(live, "Screen", _LiveScreen)
+
+    def fake_probe(host, port, ttl, timeout):
+        ports.append(port)
+        return "127.0.0.1", 1.0, True
+
+    monkeypatch.setattr(live.traceroute, "_recverr_probe", fake_probe)
+
+    rc = live.run_live_trace(
+        "http://127.0.0.1:1234/backend", max_hops=1, rounds=1,
+        timeout=0.1, method="udp")
+
+    assert rc == 0
+    assert ports == [1234]
+
+
+def test_live_returns_failure_when_no_hop_answers(monkeypatch):
+    from spdng import live
+
+    monkeypatch.setattr(live, "Screen", _LiveScreen)
+    monkeypatch.setattr(
+        live.traceroute, "_recverr_probe",
+        lambda *args, **kwargs: (None, 0.1, False))
+
+    rc = live.run_live_trace(
+        "127.0.0.1", max_hops=1, rounds=1, timeout=0.1, method="udp")
+
+    assert rc == 1
+
+
+def test_live_without_a_tracing_method_exits_with_an_error(monkeypatch,
+                                                            capsys):
+    from spdng import live
+
+    monkeypatch.setattr(live.traceroute, "choose_method", lambda host: None)
+
+    rc = live.run_live_trace("127.0.0.1", rounds=1)
+
+    assert rc == 2
+    assert "no per-hop tracing method" in capsys.readouterr().err
 
 
 def test_cloudflare_handshake_failure_is_counted_as_an_attempt(monkeypatch):
@@ -337,6 +481,7 @@ def test_ping_binary_probe_without_ping(monkeypatch):
 def test_trace_falls_back_when_no_method_is_available(monkeypatch):
     """With no raw sockets, no ping, and no UDP, we must say so."""
     monkeypatch.setattr(traceroute, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(traceroute, "has_unprivileged_icmp", lambda: False)
     monkeypatch.setattr(traceroute, "has_ping_binary", lambda: False)
     monkeypatch.setattr(traceroute, "has_recverr", lambda: False)
     t = traceroute.traceroute("127.0.0.1", max_hops=1, probes=1, timeout=0.2)
@@ -349,6 +494,7 @@ def test_trace_falls_back_when_no_method_is_available(monkeypatch):
 def test_trace_falls_back_to_udp_when_the_others_are_missing(monkeypatch):
     """With no raw sockets and no ping, UDP is the last resort."""
     monkeypatch.setattr(traceroute, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(traceroute, "has_unprivileged_icmp", lambda: False)
     monkeypatch.setattr(traceroute, "has_ping_binary", lambda: False)
     monkeypatch.setattr(traceroute, "has_recverr", lambda: True)
     t = traceroute.traceroute("127.0.0.1", max_hops=1, probes=1, timeout=0.2)

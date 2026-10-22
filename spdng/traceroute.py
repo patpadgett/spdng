@@ -26,6 +26,7 @@ When nothing is available we say so plainly rather than faking a path.
 from __future__ import annotations
 
 import errno
+import ipaddress
 import os
 import select
 import shutil
@@ -50,9 +51,11 @@ IP_RECVERR = getattr(socket, "IP_RECVERR", 11)
 IP_TTL = getattr(socket, "IP_TTL", 2)
 IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
 SOL_IPV6 = getattr(socket, "IPV6_SOL_SOCKET", 41)
-IPV6_RECVERR = getattr(socket, "IPV6_RECVERR", 26)
+IPV6_RECVERR = getattr(socket, "IPV6_RECVERR", 25)
+IPV6_UNICAST_HOPS = getattr(socket, "IPV6_UNICAST_HOPS", 16)
 MSG_ERRQUEUE = 0x2000
 IPPROTO_ICMP = 1
+IPPROTO_ICMPV6 = 58
 ICMP_ECHO = 8
 ICMP_ECHOREPLY = 0
 
@@ -250,6 +253,60 @@ def unprivileged_icmp_range() -> tuple[int, int] | None:
         return None
 
 
+def resolve_address(host: str) -> tuple[str, int]:
+    """Resolve a host once, returning (address, address family).
+
+    ``socket.gethostbyname`` is IPv4-only, so an IPv6 literal or an
+    AAAA-only name made every trace fail before it started. Prefer IPv4
+    when both families exist to preserve the old output, but keep an IPv6
+    answer rather than pretending the name does not resolve.
+    """
+    try:
+        infos = socket.getaddrinfo(
+            host, None, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+    except OSError:
+        # The caller may already have an IP literal. gethostbyname is
+        # deliberately not the primary path because it cannot resolve
+        # IPv6, but it gives the old error behaviour for bad names.
+        return socket.gethostbyname(host), socket.AF_INET
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family:
+                return info[4][0], family
+    family, _type, _proto, _canon, sockaddr = infos[0]
+    return sockaddr[0], family
+
+
+def _family_for_host(host: str) -> int:
+    """The address family of an already-resolved host, without raising."""
+    try:
+        return resolve_address(host)[1]
+    except OSError:
+        return socket.AF_INET
+
+
+def choose_method(host: str = "") -> str | None:
+    """Pick the best tracing backend for a target, or None if there is none.
+
+    Unprivileged ICMP is a real backend, not just a doctor diagnostic: on
+    Linux it uses a SOCK_DGRAM ICMP socket and the socket error queue, so
+    a user does not need CAP_NET_RAW or a setuid ping binary. Raw ICMP is
+    still preferred because it gives precise kernel timestamps, then the
+    unprivileged socket, then the ping binary, and finally UDP.
+    """
+    family = _family_for_host(host) if host else socket.AF_INET
+    if family == socket.AF_INET and has_raw_icmp():
+        return "icmp"
+    if (family == socket.AF_INET and has_unprivileged_icmp()
+            and has_recverr()):
+        return "icmp-dgram"
+    if has_ping_binary():
+        return "ping"
+    if has_recverr():
+        return "udp"
+    return None
+
+
 # --------------------------------------------------------------------------
 # raw ICMP traceroute
 # --------------------------------------------------------------------------
@@ -306,6 +363,91 @@ def _raw_icmp_probe(host: str, ttl: int, seq: int,
 
 
 # --------------------------------------------------------------------------
+# unprivileged ICMP traceroute
+# --------------------------------------------------------------------------
+
+def _dgram_icmp_probe(host: str, ttl: int, seq: int,
+                      timeout: float) -> tuple[str | None, float]:
+    """Send one ICMP echo through an unprivileged SOCK_DGRAM socket.
+
+    Linux permits ``socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`` when the
+    process's group is inside net.ipv4.ping_group_range. The kernel fills
+    in the identifier and checksum, and reports Time Exceeded replies on
+    the socket error queue when IP_RECVERR is enabled. It gives the same
+    per-hop evidence as raw ICMP without CAP_NET_RAW, so it is a better
+    fallback than spawning a ping process.
+    """
+    try:
+        sock = socket.socket(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    except (PermissionError, OSError) as exc:
+        raise TraceUnavailable(
+            f"unprivileged ICMP is not available: {exc}") from exc
+    try:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+        except OSError:
+            # Without the error queue we can still see echo replies from
+            # the destination, but not Time Exceeded from routers.
+            pass
+        sock.setsockopt(socket.IPPROTO_IP, IP_TTL, ttl)
+        payload = b"spdng-trace"
+        header = struct.pack("!BBHHH", ICMP_ECHO, 0, 0, 0, seq)
+        checksum = _checksum(header + payload)
+        packet = struct.pack(
+            "!BBHHH", ICMP_ECHO, 0, checksum, 0, seq) + payload
+        target = _resolved_ip(host)
+        start = time.perf_counter()
+        try:
+            sock.sendto(packet, (target, 0))
+        except OSError as exc:
+            if exc.errno in (errno.EPERM, errno.EACCES):
+                raise TraceUnavailable(
+                    f"unprivileged ICMP is not permitted: {exc}") from exc
+            return None, (time.perf_counter() - start) * 1000
+
+        deadline = start + timeout
+        while time.perf_counter() < deadline:
+            remaining = deadline - time.perf_counter()
+            ready, _, _ = select.select([sock], [], [], max(0.0, remaining))
+            if not ready:
+                break
+
+            # Error queue first: this is where a router's Time Exceeded
+            # message lands on Linux.
+            try:
+                data, anc, _flags, _addr = sock.recvmsg(
+                    2048, 2048, MSG_ERRQUEUE)
+            except (BlockingIOError, InterruptedError, OSError):
+                data, anc = b"", []
+            if data:
+                rtt = (time.perf_counter() - start) * 1000
+                for level, typ, cmsg in anc:
+                    if level == socket.IPPROTO_IP and typ == IP_RECVERR:
+                        router, reached = _recverr_outcome(cmsg, target)
+                        if router or reached:
+                            return router or target, rtt
+                return None, rtt
+
+            try:
+                packet_in, addr = sock.recvfrom(2048)
+            except (BlockingIOError, InterruptedError, OSError):
+                continue
+            rtt = (time.perf_counter() - start) * 1000
+            icmp = packet_in
+            if len(icmp) >= 28 and icmp[0] >> 4 == 4:
+                # Some platforms include the IPv4 header even for a
+                # datagram ICMP socket.
+                header_len = (icmp[0] & 0x0F) * 4
+                icmp = icmp[header_len:]
+            if len(icmp) >= 8 and icmp[0] == ICMP_ECHOREPLY:
+                return addr[0], rtt
+        return None, (time.perf_counter() - start) * 1000
+    finally:
+        sock.close()
+
+
+# --------------------------------------------------------------------------
 # IP_RECVERR traceroute (unprivileged)
 # --------------------------------------------------------------------------
 
@@ -336,10 +478,16 @@ def _recverr_probe(host: str, port: int, ttl: int,
     error-queue control message rather than the connected socket's peer
     address (which is always the target, even at hop one).
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    target = target_ip or _resolved_ip(host)
+    family = socket.AF_INET6 if ":" in target else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     try:
         try:
-            sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(
+                    socket.IPPROTO_IPV6, IPV6_RECVERR, 1)
+            else:
+                sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
         except OSError as exc:
             # No error queue on this platform, so this backend cannot
             # work. Say so rather than raising out of a trace.
@@ -349,7 +497,7 @@ def _recverr_probe(host: str, port: int, ttl: int,
         # expose IP_MTU_DISCOVER, and the number 10 means something
         # else entirely on macOS (it is IP_MTU there), so this is only
         # set where the option genuinely exists.
-        if _HAS_PMTU_DISCOVER:
+        if family == socket.AF_INET and _HAS_PMTU_DISCOVER:
             pmtudisc_do = getattr(socket, "IP_PMTUDISC_DO", 2)
             try:
                 sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER,
@@ -357,8 +505,12 @@ def _recverr_probe(host: str, port: int, ttl: int,
             except OSError:
                 pass
         sock.settimeout(timeout)
-        sock.connect((host, port))
-        sock.setsockopt(socket.IPPROTO_IP, IP_TTL, ttl)
+        sock.connect((target, port))
+        if family == socket.AF_INET6:
+            sock.setsockopt(
+                socket.IPPROTO_IPV6, IPV6_UNICAST_HOPS, ttl)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, IP_TTL, ttl)
         start = time.perf_counter()
         try:
             sock.send(b"spdng-trace")
@@ -370,7 +522,6 @@ def _recverr_probe(host: str, port: int, ttl: int,
                 raise
             return None, (time.perf_counter() - start) * 1000, False
 
-        target = target_ip or _resolved_ip(host)
         deadline = start + timeout
         while time.perf_counter() < deadline:
             remaining = deadline - time.perf_counter()
@@ -390,7 +541,9 @@ def _recverr_probe(host: str, port: int, ttl: int,
                 return None, (time.perf_counter() - start) * 1000, False
             rtt = (time.perf_counter() - start) * 1000
             for level, typ, cmsg in anc:
-                if level == socket.IPPROTO_IP and typ == IP_RECVERR:
+                if ((level == socket.IPPROTO_IP and typ == IP_RECVERR)
+                        or (level == socket.IPPROTO_IPV6
+                            and typ == IPV6_RECVERR)):
                     router, reached = _recverr_outcome(cmsg, target)
                     return router, rtt, reached
             return None, rtt, False
@@ -553,19 +706,25 @@ def _ping_flavour() -> str:
     return _PING_FLAVOUR
 
 
-def _ping_argv(ping: str, host: str, ttl: int, timeout: float) -> list[str]:
+def _ping_argv(ping: str, host: str, ttl: int, timeout: float,
+               ipv6: bool = False) -> list[str]:
     """The command line for one ping, for the flavour we have."""
     wait = max(1, int(timeout))
     if _ping_flavour() == "bsd":
-        # BSD and macOS: -W is milliseconds, and the TTL is -h.
+        # BSD and macOS: -W is milliseconds, and the TTL is -h. IPv6
+        # uses the separate ping6 binary on those platforms.
         return [ping, "-c", "1", "-W", str(wait * 1000), "-h", str(ttl),
+                *(["-6"] if ipv6 and ping.endswith("ping") else []),
                 host]
-    # Linux: -W is seconds, and the TTL is -t.
-    return [ping, "-c", "1", "-W", str(wait), "-t", str(ttl), host]
+    # Linux: -W is seconds, the TTL is -t, and -6 selects IPv6.
+    return [ping, "-c", "1", "-W", str(wait), "-t", str(ttl),
+            *(["-6"] if ipv6 else []), host]
 
 
 def _ping_binary_probe(host: str, ttl: int, timeout: float,
-                       count: int = 1) -> tuple[str | None, list[float], int]:
+                       count: int = 1,
+                       ipv6: bool | None = None
+                       ) -> tuple[str | None, list[float], int, bool]:
     """ICMP echo probes with a given TTL, via the ping binary.
 
     Returns (responder_address, rtt_samples_ms, sent).
@@ -587,7 +746,12 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
     import shutil
     import subprocess
 
-    ping = shutil.which("ping")
+    if ipv6 is None:
+        ipv6 = ":" in host
+    if ipv6 and _ping_flavour() == "bsd":
+        ping = shutil.which("ping6") or shutil.which("ping")
+    else:
+        ping = shutil.which("ping")
     if not ping:
         return None, [], 0, False
     wait = max(1, int(timeout))
@@ -602,7 +766,7 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
         started = time.perf_counter()
         try:
             proc = subprocess.run(
-                _ping_argv(ping, host, ttl, wait),
+                _ping_argv(ping, host, ttl, wait, ipv6=ipv6),
                 capture_output=True, text=True, timeout=wait + 5,
             )
         except subprocess.TimeoutExpired:
@@ -615,7 +779,7 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
         if m:
             samples.append(float(m.group(1)))
             exact = True
-            a = re.search(r"from\s+(\S+?):?\s+icmp_seq=\d+", out)
+            a = re.search(r"from\s+([^\s]+?):?\s+icmp_seq=\d+", out)
             if a:
                 addr = a.group(1).rstrip(":")
             continue
@@ -624,7 +788,7 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
         # and "From 192.168.1.1: icmp_seq=0 Time to live exceeded" on
         # BSD and macOS. The trailing colon has to go, or the address
         # does not parse as an IP.
-        a = re.search(r"From\s+(\S+?):?\s+icmp_seq=\d+", out)
+        a = re.search(r"From\s+([^\s]+?):?\s+icmp_seq=\d+", out)
         if a:
             addr = a.group(1).rstrip(":")
             samples.append(max(0.0, wall_ms - overhead))
@@ -635,21 +799,26 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
 
 
 def _is_ip(text: str) -> bool:
-    """Is this string an IPv4 address rather than a hostname?"""
-    parts = text.split(".")
-    if len(parts) != 4:
+    """Is this string an IP address (either family) rather than a host?"""
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
         return False
-    return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+    return True
 
 
 def _trace_ping(host: str, max_hops: int, probes: int, timeout: float,
                 result: TraceResult,
                 on_hop: Callable[[Hop], None] | None = None) -> TraceResult:
-    target_ip = _resolved_ip(host)
+    try:
+        target_ip, family = resolve_address(host)
+    except OSError:
+        target_ip, family = host, socket.AF_INET
     for ttl in range(1, max_hops + 1):
         hop = Hop(ttl=ttl)
-        addr, samples, sent, exact = _ping_binary_probe(host, ttl, timeout,
-                                                         probes)
+        addr, samples, sent, exact = _ping_binary_probe(
+            host, ttl, timeout, probes,
+            ipv6=(family == socket.AF_INET6))
         hop.sent += sent
         if addr:
             hop.addr = addr
@@ -663,20 +832,11 @@ def _trace_ping(host: str, max_hops: int, probes: int, timeout: float,
         result.hops.append(hop)
         if on_hop is not None:
             on_hop(hop)
-        if hop.addr and hop.addr == target_ip:
+        if hop.addr and _is_target(host, hop.addr):
+            hop.addr = target_ip
             hop._final = True
             result.destination_reached = True
             break
-        # ping reports the REVERSE-DNS name of the responder
-        # ("139-138-79-141.static4.bluestreamfiber.net") rather than the
-        # literal address, so a direct string compare against the target
-        # IP fails. Resolve what ping gave us and compare IPs.
-        if hop.addr and not _is_ip(hop.addr):
-            if _resolved_ip(hop.addr) == target_ip:
-                hop.addr = target_ip
-                hop._final = True
-                result.destination_reached = True
-                break
     return result
 
 
@@ -703,30 +863,62 @@ def traceroute(
     whole path. mtr works this way: you see the first hop answer while
     the rest of the path is still being measured.
     """
+    if not 1 <= port <= 65535:
+        result = TraceResult(target=host, method=method)
+        result.error = "port must be between 1 and 65535"
+        return result
+    try:
+        _target_ip, family = resolve_address(host)
+    except OSError as exc:
+        result = TraceResult(target=host, method=method)
+        result.error = f"cannot resolve {host}: {exc}"
+        return result
+
     if method == "auto":
-        if has_raw_icmp():
-            method = "icmp"
-        elif has_ping_binary():
-            method = "ping"
-        elif has_recverr():
-            method = "udp"
-        else:
+        method = choose_method(host)
+        if method is None:
             # Nothing here can trace per hop. Say so, rather than
             # starting a trace that cannot work.
             result = TraceResult(target=host, method="none")
             result.error = (
                 "no per-hop tracing method is available here: no raw "
-                "ICMP sockets, no ping binary, and no IP_RECVERR")
+                "or unprivileged ICMP sockets, no ping binary, and no "
+                "IP_RECVERR")
             return result
 
     result = TraceResult(target=host, method=method)
 
     if method == "icmp":
+        if family == socket.AF_INET6:
+            result.error = "raw ICMP traceroute supports IPv4 only"
+            return result
+        if not has_raw_icmp() and has_unprivileged_icmp() and has_recverr():
+            # "icmp" means ICMP, not specifically a raw socket. When raw
+            # sockets are unavailable, the unprivileged datagram variant
+            # is the closest equivalent and needs no extra flag.
+            method = "icmp-dgram"
+            result.method = method
+            try:
+                return _trace_dgram_icmp(
+                    host, max_hops, probes, timeout, result, on_hop)
+            except TraceUnavailable as exc:
+                result.error = str(exc)
+                return result
         try:
             return _trace_icmp(host, max_hops, probes, timeout, result,
                                on_hop)
         except PermissionError as exc:
             result.error = f"raw ICMP not permitted: {exc}"
+            return result
+    if method in ("icmp-dgram", "dgram"):
+        if family == socket.AF_INET6:
+            result.error = "unprivileged ICMP traceroute supports IPv4 only"
+            return result
+        try:
+            return _trace_dgram_icmp(host, max_hops, probes, timeout, result,
+                                     on_hop)
+        except TraceUnavailable as exc:
+            result.error = str(exc)
             return result
     if method == "ping":
         return _trace_ping(host, max_hops, probes, timeout, result, on_hop)
@@ -737,15 +929,43 @@ def traceroute(
         except TraceUnavailable as exc:
             result.error = str(exc)
             return result
+    result.error = f"unknown traceroute method: {method}"
     return result
 
 
 def _resolved_ip(host: str) -> str:
-    """Resolve a host to its IPv4 address once, tolerating failures."""
+    """Resolve a host to one address, tolerating lookup failures."""
     try:
-        return socket.gethostbyname(host)
+        return resolve_address(host)[0]
     except OSError:
         return host
+
+
+def _trace_dgram_icmp(host: str, max_hops: int, probes: int,
+                      timeout: float, result: TraceResult,
+                      on_hop: Callable[[Hop], None] | None = None
+                      ) -> TraceResult:
+    """Trace with unprivileged SOCK_DGRAM ICMP sockets."""
+    seq = 0
+    for ttl in range(1, max_hops + 1):
+        hop = Hop(ttl=ttl)
+        for _ in range(probes):
+            seq += 1
+            addr, rtt = _dgram_icmp_probe(host, ttl, seq, timeout)
+            hop.sent += 1
+            if addr:
+                hop.addr = addr
+                hop.received += 1
+                hop.rtts_ms.append(rtt)
+                hop.times_ms.append(rtt)
+        result.hops.append(hop)
+        if on_hop is not None:
+            on_hop(hop)
+        if hop.addr and _is_target(host, hop.addr):
+            hop._final = True
+            result.destination_reached = True
+            break
+    return result
 
 
 def _trace_icmp(host: str, max_hops: int, probes: int, timeout: float,
@@ -808,7 +1028,7 @@ def _trace_udp(host: str, port: int, max_hops: int, probes: int, timeout: float,
 
 def _is_target(host: str, addr: str) -> bool:
     try:
-        return socket.gethostbyname(host) == addr
+        return _resolved_ip(host) == addr
     except OSError:
         return False
 
