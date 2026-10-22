@@ -39,14 +39,52 @@ from dataclasses import dataclass, field
 # Cached measurement of `ping`'s process startup overhead in ms.
 _PING_OVERHEAD_MS: float | None = None
 
-IP_RECVERR = 11
-IP_TTL = 2
+# The IP socket option numbers are PLATFORM-SPECIFIC. IP_TTL is 2 on
+# Linux and 4 on BSD and macOS, so a hardcoded number sets the wrong
+# option off Linux - IP_RECVTTL on macOS, which does not exist, so the
+# call fails with ENOPROTOOPT.
+#
+# The socket module knows the right numbers for the platform it runs
+# on, so use them and only fall back where it does not expose one.
+IP_RECVERR = getattr(socket, "IP_RECVERR", 11)
+IP_TTL = getattr(socket, "IP_TTL", 2)
+IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
+SOL_IPV6 = getattr(socket, "IPV6_SOL_SOCKET", 41)
+IPV6_RECVERR = getattr(socket, "IPV6_RECVERR", 26)
+MSG_ERRQUEUE = 0x2000
+IPPROTO_ICMP = 1
+ICMP_ECHO = 8
+ICMP_ECHOREPLY = 0
 
 #: Does this platform have IP_RECVERR? It is Linux-only: on macOS the
 #: socket option does not exist, and setting it raises ENOPROTOOPT
 #: ("Protocol not available"). The UDP traceroute backend depends on
 #: the socket's error queue, so it cannot work there.
 _HAS_RECVERR = hasattr(socket, "IP_RECVERR")
+
+
+def _has_pmtu_discover() -> bool:
+    """Does this platform have the PMTU discovery socket option?
+
+    It is Linux-only. Python does not expose it, so the only way to
+    find out is to try it: on a platform where the number means
+    something else, the call either fails or would set the wrong
+    option. We check by trying to set it on a throwaway socket.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, 2)
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    return True
+
+
+_HAS_PMTU_DISCOVER = _has_pmtu_discover()
 
 
 def has_recverr() -> bool:
@@ -64,13 +102,6 @@ def has_recverr() -> bool:
     finally:
         sock.close()
     return True
-IP_MTU_DISCOVER = 10
-SOL_IPV6 = 41
-IPV6_RECVERR = 26
-MSG_ERRQUEUE = 0x2000
-IPPROTO_ICMP = 1
-ICMP_ECHO = 8
-ICMP_ECHOREPLY = 0
 
 
 class TraceUnavailable(RuntimeError):
@@ -286,7 +317,17 @@ def _recverr_probe(host: str, port: int, ttl: int,
             # work. Say so rather than raising out of a trace.
             raise TraceUnavailable(
                 f"IP_RECVERR is not available here: {exc}") from exc
-        sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, 2)  # PMTU discovery
+        # PMTU discovery is a Linux socket option. Python does not
+        # expose IP_MTU_DISCOVER, and the number 10 means something
+        # else entirely on macOS (it is IP_MTU there), so this is only
+        # set where the option genuinely exists.
+        if _HAS_PMTU_DISCOVER:
+            pmtudisc_do = getattr(socket, "IP_PMTUDISC_DO", 2)
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER,
+                                pmtudisc_do)
+            except OSError:
+                pass
         sock.settimeout(timeout)
         sock.connect((host, port))
         sock.setsockopt(socket.IPPROTO_IP, IP_TTL, ttl)

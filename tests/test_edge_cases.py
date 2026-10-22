@@ -103,16 +103,42 @@ def test_probe_loss_against_a_closed_port():
 
 
 def test_probe_loss_against_a_listening_port():
+    """A port that is listening and accepting must read as zero loss.
+
+    The server has to ACCEPT the connections, not just listen for them.
+    A listen backlog of one that never accepts fills up, and then the
+    next connect is refused - on Linux the kernel allows a little slack
+    and on macOS it does not, so the same test passes on one platform
+    and fails on the other. A real server accepts, so this one does
+    too.
+    """
+    import threading
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
+    srv.listen(8)
     port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def accept_loop():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except (TimeoutError, OSError):
+                continue
+            conn.close()
+
+    thread = threading.Thread(target=accept_loop, daemon=True)
+    thread.start()
     try:
         loss, rtts = traceroute.probe_loss_and_latency(
             "127.0.0.1", port=port, count=2, timeout=2.0)
         assert loss == pytest.approx(0.0)
         assert len(rtts) == 2
     finally:
+        stop.set()
+        thread.join(timeout=1)
         srv.close()
 
 
