@@ -17,6 +17,7 @@ import io
 import json
 import socket
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
@@ -388,6 +389,43 @@ def test_librespeed_join_handles_both_path_shapes():
         "https://h/backend/garbage.php"
     # trailing slashes
     assert _join("https://h/", "garbage.php") == "https://h/garbage.php"
+
+
+def test_librespeed_latency_uses_the_endpoint_path_once(http_server):
+    class PingHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        paths = []
+
+        def do_GET(self):  # noqa: N802
+            type(self).paths.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    from spdng.providers.librespeed import LibreSpeedProvider
+
+    PingHandler.paths = []
+    base = http_server(PingHandler)
+    endpoint = f"{base}/backend/empty.php"
+    srv = servers.Server(
+        id="local", host=base, sponsor="local", name="local", country="",
+        cc="", lat=0.0, lon=0.0, distance_km=0.0, url=base,
+        provider="librespeed",
+        endpoints={"download": f"{base}/backend/garbage.php",
+                   "upload": endpoint, "ping": endpoint})
+
+    result = LibreSpeedProvider().measure_latency(srv, count=3, timeout=2.0)
+
+    assert len(result.samples_ms) == 3
+    assert result.errors == 0
+    assert PingHandler.paths
+    assert all(path.startswith("/backend/empty.php?")
+               for path in PingHandler.paths)
+    assert not any("/empty.php/empty.php" in path
+                   for path in PingHandler.paths)
 
 
 def test_librespeed_coords_lookup():

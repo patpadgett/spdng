@@ -38,7 +38,8 @@ class LatencyConnection:
 
     def __init__(self, base_url: str, ua: str = DEFAULT_UA,
                  timeout: float = 10.0, verify_tls: bool = True,
-                 validator: callable | None = None) -> None:
+                 validator: callable | None = None,
+                 max_body: int = 65536) -> None:
         parts = urllib.parse.urlsplit(base_url)
         if parts.scheme not in ("http", "https"):
             raise ProbeError(f"unsupported scheme: {parts.scheme!r}")
@@ -46,9 +47,10 @@ class LatencyConnection:
         self.ua = ua
         self.timeout = timeout
         self._parts = parts
-        self._path = parts.path.rstrip("/")
+        self._base_path = parts.path.rstrip("/")
         self._conn: http.client.HTTPConnection | None = None
         self._verify_tls = verify_tls
+        self.max_body = max_body
         #: Checks the response body. Returns False for a body that is
         #: not the expected one, which counts as a failed probe.
         self.validator = validator or _default_validator
@@ -91,6 +93,26 @@ class LatencyConnection:
 
     # -- probing ------------------------------------------------------------
 
+    def _target(self, path: str, query: str) -> str:
+        """Resolve a probe path against the base URL without duplicating it.
+
+        A base URL may be an origin (``https://host``), a directory
+        (``https://host/backend``), or the full endpoint
+        (``https://host/backend/empty.php``). The providers use all three
+        shapes. If the caller's path already includes the base path, keep
+        it as-is; otherwise join it to the base path.
+        """
+        if path.startswith(("http://", "https://")):
+            absolute = urllib.parse.urlsplit(path)
+            path = absolute.path or "/"
+            if absolute.query:
+                query = absolute.query
+        path = "/" + path.lstrip("/")
+        base = self._base_path
+        if base and path != base and not path.startswith(base + "/"):
+            path = base + path
+        return f"{path}?{query}" if query else path
+
     def probe(self, path: str, stamp: str, query: str = "") -> float:
         """Run one request on the persistent connection, return the RTT.
 
@@ -105,11 +127,16 @@ class LatencyConnection:
             conn = self._ensure()
             start = time.perf_counter()
             try:
-                conn.request("GET", f"{self._path}{path}?{qs}",
+                conn.request("GET", self._target(path, qs),
                              headers={"User-Agent": self.ua,
                                       "Accept": "*/*"})
                 resp = conn.getresponse()
-                body = resp.read(64)
+                body = resp.read(self.max_body)
+                if len(body) == self.max_body:
+                    # The body is too large to be one of the tiny latency
+                    # endpoints. Leave it unread rather than letting it
+                    # desynchronise the next keep-alive request.
+                    self.close()
                 rtt = (time.perf_counter() - start) * 1000
                 if resp.status != 200 or not self.validator(body):
                     raise ProbeError(

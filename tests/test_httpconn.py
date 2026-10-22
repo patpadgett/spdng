@@ -159,6 +159,53 @@ def test_the_permissive_validator_accepts_anything():
     assert ok(b"whatever") is True
 
 
+def test_a_base_path_is_not_duplicated(http_server):
+    seen = []
+
+    class PathHandler(_Handler):
+        def do_GET(self):  # noqa: N802
+            seen.append(self.path)
+            super().do_GET()
+
+    base = http_server(PathHandler)
+    conn = LatencyConnection(f"{base}/backend", validator=ok)
+    try:
+        conn.probe("/empty.php", "1")
+        conn.probe("/backend/empty.php", "2")
+    finally:
+        conn.close()
+
+    assert seen[0].startswith("/backend/empty.php?")
+    assert seen[1].startswith("/backend/empty.php?")
+    assert all("/backend/backend" not in path for path in seen)
+
+
+def test_probe_reads_the_whole_body(http_server):
+    body = b"test=test" + (b"-" * 200) + b"tail"
+    captured = []
+
+    class LargeBodyHandler(_Handler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    base = http_server(LargeBodyHandler)
+
+    def validator(candidate):
+        captured.append(candidate)
+        return candidate.endswith(b"tail")
+
+    conn = LatencyConnection(base, validator=validator)
+    try:
+        assert conn.probe("/latency.txt", "1") > 0
+    finally:
+        conn.close()
+
+    assert captured and len(captured[0]) == len(body)
+
+
 def test_a_custom_query_is_sent(server):
     """Cloudflare's endpoint needs bytes=0, not just a cache buster."""
     seen = []
