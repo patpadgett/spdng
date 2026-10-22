@@ -6,6 +6,8 @@ wrong silently misaligns every column after the first coloured one.
 """
 from __future__ import annotations
 
+import pytest
+
 from spdng import frames, style, table
 from spdng.tui import (
     PROBE_ERROR,
@@ -296,6 +298,15 @@ def test_result_table_without_latency():
     assert "1800000" not in out
 
 
+@pytest.mark.xfail(strict=True, reason="skipped directions are still reported as zero")
+def test_skipped_download_is_not_a_fabricated_zero():
+    r = _result()
+    r.download_mbps = None
+    out = frames.result_table(r)
+    assert "skipped" in out.lower() or "n/a" in out.lower()
+    assert "on fire" not in out.lower()
+
+
 def test_result_csv_has_a_header_and_rows():
     csv_text = frames.result_to_csv(_result())
     lines = csv_text.strip().split("\n")
@@ -381,6 +392,25 @@ def test_comparison_rows_line_up():
         # The label column is 11 wide, so every row's first data
         # character sits at the same offset.
         assert line[11] != " ", f"row is not indented to the label column: {line!r}"
+
+
+@pytest.mark.xfail(strict=True, reason="compare pads ANSI strings with len()")
+def test_comparison_rows_line_up_with_colour():
+    """Numbers must stay in their columns when colour is enabled."""
+    style.set_color(True)
+    try:
+        from spdng import compare
+        out = compare.render_comparison(
+            [_comp_result("A", 100.0, 20.0), _comp_result("B", 200.0, 30.0)],
+            ["one", "two"])
+        lines = out.split("\n")
+        header = next(line for line in lines if "one" in line and "two" in line)
+        target = table.visible_width(header)
+        for line in lines:
+            if line.startswith(("Download", "Upload", "Ping", "Jitter", "Loss")):
+                assert table.visible_width(line) == target, repr(line)
+    finally:
+        style.set_color(None)
 
 
 def test_comparison_server_row_is_one_line_per_provider():
