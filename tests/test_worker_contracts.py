@@ -41,6 +41,11 @@ class _UploadHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     posts = 0
     payload_bytes = 0
+    connections = 0
+
+    def setup(self):
+        type(self).connections += 1
+        super().setup()
 
     def do_POST(self):  # noqa: N802
         type(self).posts += 1
@@ -64,12 +69,14 @@ def test_download_worker_counts_the_body_it_reads(http_server):
     errors = [0]
 
     started = time.perf_counter()
-    download_worker(f"{base}/payload", "spdng-test", started + 1.0,
+    download_worker(f"{base}/payload", "spdng-test", started + 0.4,
                     counter, errors)
+    elapsed = time.perf_counter() - started
 
     assert errors[0] == 0
     assert counter[0] >= len(_DownloadHandler.body)
-    assert _DownloadHandler.gets >= 1
+    assert _DownloadHandler.gets > 1
+    assert elapsed >= 0.35
 
 
 def test_download_worker_records_an_http_error(http_server):
@@ -91,6 +98,7 @@ def test_upload_worker_counts_bytes_it_posts(http_server):
 
     _UploadHandler.posts = 0
     _UploadHandler.payload_bytes = 0
+    _UploadHandler.connections = 0
     base = http_server(_UploadHandler)
     counter = [0]
     errors = [0]
@@ -101,4 +109,5 @@ def test_upload_worker_counts_bytes_it_posts(http_server):
     assert errors[0] == 0
     assert counter[0] > 0
     assert counter[0] == _UploadHandler.payload_bytes
-    assert _UploadHandler.posts >= 1
+    assert _UploadHandler.posts > 1
+    assert _UploadHandler.connections == 1
