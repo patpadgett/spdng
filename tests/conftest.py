@@ -18,7 +18,7 @@ import pytest
 
 def pytest_collection_modifyitems(config, items):
     """Skip the live tests unless SPDNG_LIVE=1 is set."""
-    if os.environ.get("SPDGNG_LIVE"):
+    if os.environ.get("SPDNG_LIVE"):
         return
     skip_live = pytest.mark.skip(
         reason="hits the network; set SPDNG_LIVE=1 to run it")
