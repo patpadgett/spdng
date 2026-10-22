@@ -88,8 +88,22 @@ _HAS_PMTU_DISCOVER = _has_pmtu_discover()
 
 
 def has_recverr() -> bool:
-    """Can this platform deliver ICMP errors to an unprivileged UDP socket?"""
+    """Can this platform deliver ICMP errors to an unprivileged UDP socket?
+
+    This checks that the option is ACCEPTED, which is not the same as
+    it working. On macOS the `IP_RECVERR` constant exists in the
+    socket module, so `hasattr` says yes, but the option does not do
+    anything: there is no error queue, so the probes would never see
+    a router reply and every hop would come back empty. That is
+    silently wrong, which is worse than not having the backend.
+
+    So the check is: can we set the option, and does the platform
+    actually have the error-queue machinery? The MSG_ERRQUEUE flag is
+    the giveaway - it is Linux-only.
+    """
     if not _HAS_RECVERR:
+        return False
+    if not hasattr(socket, "MSG_ERRQUEUE"):
         return False
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
