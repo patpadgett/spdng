@@ -18,6 +18,7 @@ import json
 import socket
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler
+from types import SimpleNamespace
 
 import pytest
 
@@ -399,6 +400,67 @@ def test_unknown_provider_exits_with_an_error():
     from spdng.cli import main
     rc = main(["speedtest", "--provider", "nope"])
     assert rc == 2
+
+
+@pytest.mark.parametrize("argv", [
+    ["speedtest", "--duration", "0"],
+    ["speedtest", "--threads", "0"],
+    ["speedtest", "--latency-samples", "0"],
+    ["speedtest", "--duration", "nan"],
+    ["speedtest", "--max-distance", "-1"],
+    ["watch", "--interval", "0"],
+])
+def test_invalid_numeric_options_exit_before_measuring(argv, capsys):
+    from spdng.cli import main
+
+    rc = main(argv)
+
+    assert rc == 2
+    assert "must be" in capsys.readouterr().err
+
+
+def test_no_latency_skips_the_latency_probe():
+    from spdng.cli import _run_one
+
+    class NeverCalledProvider:
+        id = "fake"
+        label = "Fake"
+
+        def measure_latency(self, *args, **kwargs):
+            raise AssertionError("latency should not be measured")
+
+    args = SimpleNamespace(
+        no_latency=True,
+        no_download=True,
+        no_upload=True,
+        latency_samples=5,
+        duration=1.0,
+        threads=1,
+    )
+
+    result, trace = _run_one(
+        NeverCalledProvider(), object(), args, do_trace=False)
+
+    assert trace is None
+    assert result.latency.attempts == 0
+    assert result.latency.errors == 0
+    assert result.download_mbps is None
+    assert result.upload_mbps is None
+
+
+def test_no_latency_is_rendered_as_skipped_not_failed():
+    from spdng import frames
+
+    result = measure.SpeedTestResult(server=None)
+    result.latency = measure.LatencyResult()
+
+    table = frames.result_table(result, fun_on=False)
+    plain = render.render_result(result)
+
+    assert "skipped" in table.lower()
+    assert "unavailable" not in table.lower()
+    assert "Ping: skipped" in plain
+    assert "not measured" in frames.result_to_csv(result)
 
 
 def test_doctor_never_raises():

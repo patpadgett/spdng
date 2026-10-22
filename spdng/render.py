@@ -81,6 +81,8 @@ def render_result(result: SpeedTestResult, show_server: bool = True,
         out.append(f"Ping: {c(f'{result.latency.avg_ms:.2f}', 'bold')} ms   "
                    f"jitter: {result.latency.jitter_ms:.2f} ms   "
                    f"loss: {result.latency.loss_pct:.0f}%")
+    elif result.latency.attempts == 0 and result.latency.errors == 0:
+        out.append("Ping: " + c("skipped", "muted"))
     else:
         out.append("Ping: " + c('unavailable', 'bold') +
                    "   (latency probe failed; not reporting a placeholder)")

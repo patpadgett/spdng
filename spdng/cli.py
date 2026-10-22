@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import sys
 import time
@@ -98,15 +99,16 @@ def _run_one(provider, server, args, *, do_trace: bool):
     result.provider = provider.id
     result.provider_label = provider.label
 
-    result.latency = provider.measure_latency(
-        server, count=args.latency_samples)
-    server.latency_ms = result.latency.avg_ms
-    server.jitter_ms = result.latency.jitter_ms
+    if not args.no_latency:
+        result.latency = provider.measure_latency(
+            server, count=args.latency_samples)
+        server.latency_ms = result.latency.avg_ms
+        server.jitter_ms = result.latency.jitter_ms
 
-    if result.latency.avg_ms is None:
-        result.errors.append(
-            "latency probe failed against every server; "
-            "the server may require a browser session")
+        if result.latency.avg_ms is None:
+            result.errors.append(
+                "latency probe failed against every server; "
+                "the server may require a browser session")
 
     if not args.no_download:
         result.download_detail = provider.measure_download(
@@ -940,9 +942,43 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _validation_error(args) -> str | None:
+    """Reject nonsensical numeric options before touching the network."""
+    positive = [
+        ("duration", "--duration"),
+        ("threads", "--threads"),
+        ("latency_samples", "--latency-samples"),
+        ("limit", "--limit"),
+        ("trace_probes", "--trace-probes"),
+        ("count", "--count"),
+        ("show", "--show"),
+        ("max_hops", "--max-hops"),
+        ("interval", "--interval"),
+        ("timeout", "--timeout"),
+        ("trace_timeout", "--trace-timeout"),
+    ]
+    for attr, flag in positive:
+        value = getattr(args, attr, None)
+        if value is None:
+            continue
+        if not math.isfinite(value) or value <= 0:
+            return f"{flag} must be a positive finite number"
+    for attr, flag in (("max_distance", "--max-distance"),
+                       ("rounds", "--rounds"),
+                       ("watch_duration", "--watch-duration")):
+        value = getattr(args, attr, None)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            return f"{flag} must be zero or a positive finite number"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    error = _validation_error(args)
+    if error:
+        print(f"spdng: {error}", file=sys.stderr)
+        return 2
     try:
         return args.func(args)
     except KeyboardInterrupt:

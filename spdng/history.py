@@ -110,7 +110,8 @@ def entry_from_result(result, provider_id: str = "ookla") -> HistoryEntry:
         upload_mbps=result.upload_mbps,
         ping_ms=result.latency.avg_ms,
         jitter_ms=result.latency.jitter_ms,
-        loss_pct=result.latency.loss_pct,
+        loss_pct=(result.latency.loss_pct
+                  if result.latency.attempts else None),
     )
 
 

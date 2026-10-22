@@ -33,6 +33,9 @@ def result_table(result, fun_on: bool = True) -> str:
         if lat.handshake_ms is not None:
             detail += f"   setup {lat.handshake_ms:.0f} ms"
         t.add_row(["Ping", f"{lat.avg_ms:.2f} ms", detail])
+    elif lat.attempts == 0 and lat.errors == 0:
+        t.add_row(["Ping", style.paint("skipped", "muted"),
+                   "not measured"])
     else:
         t.add_row([
             "Ping",
@@ -207,7 +210,9 @@ def result_to_csv(result) -> str:
                      "ms", f"jitter={lat.jitter_ms}"])
     writer.writerow(["jitter", f"{lat.jitter_ms:.4f}"
                      if lat.jitter_ms is not None else "", "ms", ""])
-    writer.writerow(["loss", f"{lat.loss_pct:.2f}", "%", ""])
+    writer.writerow(["loss",
+                     f"{lat.loss_pct:.2f}" if lat.attempts else "",
+                     "%", "" if lat.attempts else "not measured"])
     writer.writerow([
         "download",
         f"{result.download_mbps:.4f}" if result.download_mbps is not None
