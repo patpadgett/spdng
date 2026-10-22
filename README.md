@@ -153,7 +153,7 @@ networks, and you can compare them:
 |---|---|---|
 | `ookla` | the nearest speedtest server, chosen by distance | Ookla's server network (a commercial company; this API is unofficial) |
 | `cloudflare` | the nearest Cloudflare data centre | Cloudflare's own. This is the network almost all of your internet traffic crosses, so it is a different and often more relevant question |
-| `librespeed` | a community-run LibreSpeed server | open source, and self-hostable: `--server https://your-own-box/backend` tests against a machine you control, which is the only way to measure a specific vantage point |
+| `librespeed` | a community-run LibreSpeed server | open source, and self-hostable: `--server https://your-own-box/backend` (a real example URL, replaced with your own host) tests against a machine you control, which is the only way to measure a specific vantage point |
 
 Netflix's **fast.com** is deliberately *not* supported. Its API sits behind
 Akamai bot protection that rejects non-browser clients with a 403, and
