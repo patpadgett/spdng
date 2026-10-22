@@ -309,8 +309,20 @@ def _raw_icmp_probe(host: str, ttl: int, seq: int,
 # IP_RECVERR traceroute (unprivileged)
 # --------------------------------------------------------------------------
 
+#: Linux errqueue origins and ICMP types we need to tell apart.
+SO_EE_ORIGIN_ICMP = 2
+SO_EE_ORIGIN_ICMP6 = 3
+ICMP_DEST_UNREACH = 3
+ICMP_TIME_EXCEEDED = 11
+ICMP6_DEST_UNREACH = 1
+ICMP6_TIME_EXCEEDED = 3
+ICMP_PORT_UNREACH = 3
+ICMP6_PORT_UNREACH = 4
+
+
 def _recverr_probe(host: str, port: int, ttl: int,
-                   timeout: float) -> tuple[str | None, float, bool]:
+                   timeout: float,
+                   target_ip: str | None = None) -> tuple[str | None, float, bool]:
     """Send a UDP datagram with a TTL and wait for the error queue.
 
     Returns (router_or_none, rtt_ms, reached_destination).
@@ -319,8 +331,10 @@ def _recverr_probe(host: str, port: int, ttl: int,
     surface as ECONNREFUSED. That does NOT mean we reached the destination;
     it means the local stack rejected the datagram. Treating it as
     "reached" made every trace collapse to a single hop. We therefore only
-    report "reached" when the TTL was high enough to plausibly traverse the
-    path AND we actually saw an ICMP port-unreachable from the far end.
+    report "reached" when the queued error is an ICMP port-unreachable
+    from the far end, and we use the offender address carried in the
+    error-queue control message rather than the connected socket's peer
+    address (which is always the target, even at hop one).
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -356,6 +370,7 @@ def _recverr_probe(host: str, port: int, ttl: int,
                 raise
             return None, (time.perf_counter() - start) * 1000, False
 
+        target = target_ip or _resolved_ip(host)
         deadline = start + timeout
         while time.perf_counter() < deadline:
             remaining = deadline - time.perf_counter()
@@ -369,44 +384,75 @@ def _recverr_probe(host: str, port: int, ttl: int,
             except OSError as exc:
                 if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     continue
-                if exc.errno == errno.ECONNREFUSED:
-                    # A real ICMP port-unreachable came back from the far end.
-                    return None, (time.perf_counter() - start) * 1000, True
+                # An exception here does not carry the offender address
+                # or the ICMP type. Without that evidence, keep the probe
+                # inconclusive rather than claiming we reached the target.
                 return None, (time.perf_counter() - start) * 1000, False
             rtt = (time.perf_counter() - start) * 1000
             for level, typ, cmsg in anc:
                 if level == socket.IPPROTO_IP and typ == IP_RECVERR:
-                    router = _router_from_cmsg(cmsg)
-                    if router:
-                        return router, rtt, False
-                    # An error arrived but we could not attribute it to a
-                    # router. If the error was "host unreachable" we are
-                    # likely at the destination.
-                    return None, rtt, True
+                    router, reached = _recverr_outcome(cmsg, target)
+                    return router, rtt, reached
             return None, rtt, False
         return None, (time.perf_counter() - start) * 1000, False
     finally:
         sock.close()
 
 
-def _router_from_cmsg(cmsg: bytes) -> str | None:
-    """Extract the router address from a struct sock_extended_err payload."""
+def _recverr_outcome(cmsg: bytes, target_ip: str) -> tuple[str | None, bool]:
+    """Classify an IP_RECVERR control message as (offender, reached)."""
+    router = _router_from_cmsg(cmsg)
+    details = _recverr_details(cmsg)
+    if details is None:
+        return router, False
+    origin, icmp_type, icmp_code = details
+    if origin == SO_EE_ORIGIN_ICMP:
+        if icmp_type == ICMP_TIME_EXCEEDED:
+            return router, False
+        if icmp_type == ICMP_DEST_UNREACH:
+            if icmp_code == ICMP_PORT_UNREACH:
+                return router or target_ip, True
+            return router, False
+    elif origin == SO_EE_ORIGIN_ICMP6:
+        if icmp_type == ICMP6_TIME_EXCEEDED:
+            return router, False
+        if icmp_type == ICMP6_DEST_UNREACH:
+            if icmp_code == ICMP6_PORT_UNREACH:
+                return router or target_ip, True
+            return router, False
+    return router, False
+
+
+def _recverr_details(cmsg: bytes) -> tuple[int, int, int] | None:
+    """Return (origin, ICMP type, ICMP code) from sock_extended_err."""
     if len(cmsg) < 16:
         return None
-    # struct sock_extended_err {
-    #   u8 ee_errno; u8 ee_origin; u8 ee_type; u8 ee_code; u8 ee_pad;
-    #   u32 ee_info; u32 ee_data;
-    # } followed by the offending IP header + 8 bytes
-    payload = cmsg[16:]
-    if len(payload) < 20:
+    try:
+        (_errno, origin, icmp_type, icmp_code, _pad,
+         _info, _data) = struct.unpack_from("=I4BII", cmsg, 0)
+    except struct.error:
         return None
-    ihl = (payload[0] & 0x0F) * 4
-    if ihl < 20 or len(payload) < ihl:
+    return origin, icmp_type, icmp_code
+
+
+def _router_from_cmsg(cmsg: bytes) -> str | None:
+    """Extract the offending router address from an IP_RECVERR payload.
+
+    The payload is a struct sock_extended_err followed by the offender
+    address (SO_EE_OFFENDER), a sockaddr_storage. The address returned by
+    recvmsg() is the connected peer (always the target), so it cannot be
+    used as the router address.
+    """
+    if len(cmsg) < 16:
         return None
-    # The source of the *embedded* IP packet is the router that replied.
-    # Linux copies the original packet's header here, so the embedded src is
-    # our source, not the router. The router address itself is not in the
-    # error queue payload, so we fall back to the outer source address.
+    try:
+        family = struct.unpack_from("=H", cmsg, 16)[0]
+    except struct.error:
+        return None
+    if family == socket.AF_INET and len(cmsg) >= 24:
+        return socket.inet_ntoa(cmsg[20:24])
+    if family == socket.AF_INET6 and len(cmsg) >= 40:
+        return socket.inet_ntop(socket.AF_INET6, cmsg[24:40])
     return None
 
 
@@ -730,11 +776,13 @@ def _trace_icmp(host: str, max_hops: int, probes: int, timeout: float,
 def _trace_udp(host: str, port: int, max_hops: int, probes: int, timeout: float,
                result: TraceResult,
                on_hop: Callable[[Hop], None] | None = None) -> TraceResult:
+    target_ip = _resolved_ip(host)
     for ttl in range(1, max_hops + 1):
         hop = Hop(ttl=ttl)
         reached = False
         for _ in range(probes):
-            addr, rtt, reached = _recverr_probe(host, port, ttl, timeout)
+            addr, rtt, reached = _recverr_probe(
+                host, port, ttl, timeout, target_ip=target_ip)
             hop.sent += 1
             if reached:
                 hop.received += 1
