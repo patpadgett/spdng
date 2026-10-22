@@ -203,8 +203,22 @@ def test_watch_does_not_clear_a_redirected_stream(capsys):
     assert "\033[K" not in out
 
 
-def test_watch_retries_after_a_failed_sample(capsys):
+def test_watch_retries_after_a_failed_sample(capsys, monkeypatch):
     calls = []
+
+    class FakeClock:
+        """A clock that only moves when the watch loop sleeps."""
+
+        def __init__(self):
+            self.now = 0.0
+
+        def perf_counter(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    monkeypatch.setattr(watch, "time", FakeClock())
 
     def run_once():
         calls.append(1)
