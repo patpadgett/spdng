@@ -72,3 +72,6 @@ secrets.toml
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Misc
+LAUNCH.md
