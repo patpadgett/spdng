@@ -199,6 +199,12 @@ test, and it is usually the interesting one.
 pipx install spdng          # or: pip install spdng
 ```
 
+Or with Homebrew:
+
+```bash
+brew install patpadgett/spdng/spdng
+```
+
 No dependencies beyond the Python standard library. Python 3.10+.
 
 From source:
