@@ -63,11 +63,21 @@ _SGR_BASE_COLORS: dict[str, int] = {
 }
 
 #: SGR codes that are text attributes rather than colours.
+#:
+#: Not every attribute exists on every platform: `curses.A_ITALIC` is
+#: missing on macOS, and `A_UNDERLINE` is missing on some builds. So
+#: each one is looked up defensively and the ones that are not there
+#: simply do not apply.
+def _attr(name: str) -> int:
+    """A curses attribute, or 0 if this platform does not have it."""
+    return getattr(curses, name, 0)
+
+
 _SGR_ATTRIBUTES: dict[str, int] = {
-    "1": curses.A_BOLD,
-    "2": curses.A_DIM,
-    "3": curses.A_ITALIC,
-    "4": curses.A_UNDERLINE,
+    "1": _attr("A_BOLD"),
+    "2": _attr("A_DIM"),
+    "3": _attr("A_ITALIC"),
+    "4": _attr("A_UNDERLINE"),
 }
 
 #: The bright SGR codes, in the order they appear in 90-97.

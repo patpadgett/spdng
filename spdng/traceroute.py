@@ -373,6 +373,67 @@ def _ping_startup_overhead() -> float:
     return _PING_OVERHEAD_MS
 
 
+#: Which flavour of `ping` we have: "linux" or "bsd". None until it is
+#: worked out.
+_PING_FLAVOUR: str | None = None
+
+
+def _ping_flavour() -> str:
+    """Work out which `ping` this is.
+
+    The two flavours differ in ways that matter here:
+
+    * The TTL flag. Linux uses `-t ttl`. BSD and macOS used to as
+      well, but macOS changed `-t` to mean the TIMEOUT and moved the
+      TTL to `-h hoplimit`. So on macOS, `-t 5` sets a five-second
+      timeout and the packet leaves with the default TTL of 64 - every
+      hop would look like the final hop, and the whole trace would be
+      wrong.
+    * The units of `-W`. Linux takes SECONDS, BSD and macOS take
+      MILLISECONDS.
+
+    So we ask the binary rather than guessing from the platform, because
+    a Linux user on macOS (or vice versa) is not that rare and the
+    guess would be wrong.
+    """
+    global _PING_FLAVOUR
+    if _PING_FLAVOUR is not None:
+        return _PING_FLAVOUR
+
+    import shutil
+    import subprocess
+
+    ping = shutil.which("ping")
+    _PING_FLAVOUR = "linux"
+    if not ping:
+        return _PING_FLAVOUR
+    try:
+        # `ping -v` prints the version and the usage on every
+        # platform, and it exits without sending anything.
+        proc = subprocess.run([ping, "-v"], capture_output=True, text=True,
+                              timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return _PING_FLAVOUR
+    out = (proc.stdout or "") + (proc.stderr or "")
+    lowered = out.lower()
+    if "bsd" in lowered or "darwin" in lowered or "mac os" in lowered:
+        _PING_FLAVOUR = "bsd"
+    elif "-h hoplimit" in lowered or "hoplimit" in lowered:
+        _PING_FLAVOUR = "bsd"
+    return _PING_FLAVOUR
+
+
+def _ping_argv(ping: str, host: str, ttl: int, timeout: float) -> list[str]:
+    """The command line for one ping, for the flavour we have."""
+    wait = max(1, int(timeout))
+    if _ping_flavour() == "bsd":
+        # BSD and macOS: -W is milliseconds, and the TTL is -h.
+        return [ping, "-c", "1", "-W", str(wait * 1000), "-h", str(ttl),
+                host]
+    # Linux: -W is seconds, and the TTL is -t.
+    return [ping, "-c", "1", "-W", str(wait), "-t", str(ttl), host]
+
+
 def _ping_binary_probe(host: str, ttl: int, timeout: float,
                        count: int = 1) -> tuple[str | None, list[float], int]:
     """ICMP echo probes with a given TTL, via the ping binary.
@@ -411,7 +472,7 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
         started = time.perf_counter()
         try:
             proc = subprocess.run(
-                [ping, "-c", "1", "-W", str(wait), "-t", str(ttl), host],
+                _ping_argv(ping, host, ttl, wait),
                 capture_output=True, text=True, timeout=wait + 5,
             )
         except subprocess.TimeoutExpired:
@@ -424,15 +485,18 @@ def _ping_binary_probe(host: str, ttl: int, timeout: float,
         if m:
             samples.append(float(m.group(1)))
             exact = True
-            a = re.search(r"from\s+(\S+?):\s+icmp_seq=\d+", out)
+            a = re.search(r"from\s+(\S+?):?\s+icmp_seq=\d+", out)
             if a:
-                addr = a.group(1)
+                addr = a.group(1).rstrip(":")
             continue
 
-        # "From 192.168.1.1 icmp_seq=1 Time to live exceeded"
-        a = re.search(r"From\s+(\S+)\s+icmp_seq=\d+", out)
+        # "From 192.168.1.1 icmp_seq=1 Time to live exceeded" on Linux,
+        # and "From 192.168.1.1: icmp_seq=0 Time to live exceeded" on
+        # BSD and macOS. The trailing colon has to go, or the address
+        # does not parse as an IP.
+        a = re.search(r"From\s+(\S+?):?\s+icmp_seq=\d+", out)
         if a:
-            addr = a.group(1)
+            addr = a.group(1).rstrip(":")
             samples.append(max(0.0, wall_ms - overhead))
 
     if exact:

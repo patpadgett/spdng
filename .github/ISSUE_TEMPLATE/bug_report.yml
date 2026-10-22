@@ -1,0 +1,83 @@
+name: Bug report
+description: Something is wrong, or something is reported wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. `spdng doctor` is the most useful thing
+        to include: it says what the environment supports (raw ICMP
+        sockets, unprivileged ICMP, the `ping` binary, the traceroute
+        method in use) and most traceroute problems are environment
+        problems.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you see, and what did you expect?
+      placeholder: |
+        `spdng speedtest` reported 0.00 Mbit/s upload. I expected the
+        number my ISP shows.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command
+      description: The command you ran, copied and pasted.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: The output
+      description: The whole output, not a summary of it.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: The output of `spdng doctor`
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "spdng 0.7.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - pip install spdng
+        - pipx
+        - A Homebrew tap
+        - From source
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, Python version, and whether you are in a container or WSL.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran `spdng doctor` and included the output.
+          required: false
