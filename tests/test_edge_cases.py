@@ -203,6 +203,67 @@ def test_json_output_is_valid_for_an_empty_result():
     assert json.loads(json.dumps(payload))["download_mbps"] == 0.0
 
 
+def test_latency_loss_is_never_above_one_hundred_percent():
+    r = measure.LatencyResult(samples_ms=[], errors=5, attempts=3)
+    assert r.loss_pct == pytest.approx(100.0)
+
+
+def test_live_icmp_timeout_is_not_a_successful_probe(monkeypatch):
+    from spdng import live
+
+    monkeypatch.setattr(traceroute, "_raw_icmp_probe",
+                        lambda *args, **kwargs: (None, 2000.0))
+    _ttl, addr, rtt, outcome = live.probe_hop(
+        "192.0.2.1", 33434, 1, 2.0, "icmp")
+    assert outcome == live.PROBE_TIMEOUT
+    assert addr is None
+    assert rtt is None
+
+
+def test_live_udp_timeout_is_not_a_successful_probe(monkeypatch):
+    from spdng import live
+
+    monkeypatch.setattr(traceroute, "_recverr_probe",
+                        lambda *args, **kwargs: (None, 2000.0, False))
+    _ttl, addr, rtt, outcome = live.probe_hop(
+        "192.0.2.1", 33434, 1, 2.0, "udp")
+    assert outcome == live.PROBE_TIMEOUT
+    assert addr is None
+    assert rtt is None
+
+
+def test_cloudflare_handshake_failure_is_counted_as_an_attempt(monkeypatch):
+    from spdng.httpconn import ProbeError
+    from spdng.providers import cloudflare
+
+    def fail_connect(*args, **kwargs):
+        raise TimeoutError("no handshake")
+
+    monkeypatch.setattr(cloudflare.socket, "create_connection", fail_connect)
+
+    class FakeConnection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def warm_up(self, *args, **kwargs):
+            return False
+
+        def probe(self, *args, **kwargs):
+            raise ProbeError("no probe")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("spdng.httpconn.LatencyConnection",
+                        lambda *args, **kwargs: FakeConnection())
+    provider = cloudflare.CloudflareProvider()
+    result = provider.measure_latency(provider._server(), count=2, timeout=0.1)
+
+    assert result.attempts == 3
+    assert result.errors == 3
+    assert result.loss_pct == pytest.approx(100.0)
+
+
 def test_render_result_with_no_server():
     r = measure.SpeedTestResult(server=None)
     out = render.render_result(r)

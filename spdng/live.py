@@ -59,6 +59,11 @@ def probe_hop(host: str, port: int, ttl: int, timeout: float,
     if method == "icmp":
         try:
             addr, rtt = traceroute._raw_icmp_probe(host, ttl, ttl, timeout)
+            if addr is None:
+                # _raw_icmp_probe returns the elapsed time even when no
+                # reply arrived. That is a timeout, not a successful
+                # probe with a timeout-sized RTT.
+                return ttl, None, None, PROBE_TIMEOUT
             return ttl, addr, rtt, PROBE_OK
         except PermissionError:
             return ttl, None, None, PROBE_ERROR
@@ -72,9 +77,7 @@ def probe_hop(host: str, port: int, ttl: int, timeout: float,
         return ttl, None, None, PROBE_TIMEOUT
     # udp / IP_RECVERR
     addr, rtt, reached = traceroute._recverr_probe(host, port, ttl, timeout)
-    if reached:
-        return ttl, addr, rtt, PROBE_OK
-    if addr:
+    if reached or addr:
         return ttl, addr, rtt, PROBE_OK
     return ttl, None, None, PROBE_TIMEOUT
 

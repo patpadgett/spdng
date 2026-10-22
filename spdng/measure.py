@@ -50,7 +50,9 @@ class LatencyResult:
     def loss_pct(self) -> float:
         if not self.attempts:
             return 100.0
-        return self.errors * 100.0 / self.attempts
+        # Keep the percentage meaningful even if a provider reports a
+        # setup error separately from its probe attempts.
+        return min(max(self.errors, 0), self.attempts) * 100.0 / self.attempts
 
     @property
     def avg_ms(self) -> float | None:
