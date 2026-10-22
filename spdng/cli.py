@@ -837,24 +837,44 @@ def cmd_moo(args) -> int:
     return 0
 
 
+def _add_global_options(parser: argparse.ArgumentParser,
+                        *, suppress_defaults: bool = False) -> None:
+    """Add the options that apply to every subcommand.
+
+    The same options are registered on each subparser so they work before
+    or after the command name. On the child parsers the defaults are
+    suppressed: otherwise an absent child flag would overwrite the value
+    the parent parser already parsed.
+    """
+    default = argparse.SUPPRESS if suppress_defaults else False
+    parser.add_argument("--version", action="version",
+                        version=f"spdng {__version__}")
+    parser.add_argument("--no-color", action="store_true", default=default,
+                        help="disable colour output (also honours NO_COLOR)")
+    parser.add_argument("--color", action="store_true", default=default,
+                        help="force colour output even when piped")
+    parser.add_argument("--theme", choices=sorted(style.THEMES),
+                        default=(argparse.SUPPRESS if suppress_defaults
+                                 else "default"),
+                        help="colour theme")
+    parser.add_argument("--no-fun", action="store_true", default=default,
+                        help="no grades, no speedometer, no wisecracks")
+    parser.add_argument("--no-history", action="store_true", default=default,
+                        help="do not record this result to the local history")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="spdng",
         description="A maintained speedtest CLI with mtr-style path analysis.",
     )
-    p.add_argument("--version", action="version",
-                   version=f"spdng {__version__}")
-    p.add_argument("--no-color", action="store_true",
-                   help="disable colour output (also honours NO_COLOR)")
-    p.add_argument("--color", action="store_true",
-                   help="force colour output even when piped")
-    p.add_argument("--theme", choices=sorted(style.THEMES), default="default",
-                   help="colour theme")
-    p.add_argument("--no-fun", action="store_true",
-                   help="no grades, no speedometer, no wisecracks")
-    p.add_argument("--no-history", action="store_true",
-                   help="do not record this result to the local history")
+    _add_global_options(p)
     sub = p.add_subparsers(dest="command", required=True)
+
+    def add_subparser(name: str, **kwargs) -> argparse.ArgumentParser:
+        sp = sub.add_parser(name, **kwargs)
+        _add_global_options(sp, suppress_defaults=True)
+        return sp
 
     def add_common(sp):
         sp.add_argument("--json", action="store_true",
@@ -890,30 +910,30 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-hops", type=int, default=20)
         sp.add_argument("-v", "--verbose", action="store_true")
 
-    sp = sub.add_parser("speedtest", help="run a bandwidth test")
+    sp = add_subparser("speedtest", help="run a bandwidth test")
     add_common(sp)
     sp.set_defaults(func=cmd_speedtest)
 
-    sp = sub.add_parser("compare",
-                         help="test against several providers and line them up")
+    sp = add_subparser("compare",
+                        help="test against several providers and line them up")
     add_common(sp)
     sp.add_argument("--providers", nargs="+",
                     default=["ookla", "cloudflare", "librespeed"],
                     help="which providers to compare")
     sp.set_defaults(func=cmd_compare)
 
-    sp = sub.add_parser("repeat",
-                         help="run the same test several times to see the spread")
+    sp = add_subparser("repeat",
+                        help="run the same test several times to see the spread")
     add_common(sp)
     sp.add_argument("--count", type=int, default=3,
                     help="how many times to run the test")
     sp.set_defaults(func=cmd_repeat)
 
-    sp = sub.add_parser("servers", help="list candidate servers, nearest first")
+    sp = add_subparser("servers", help="list candidate servers, nearest first")
     add_common(sp)
     sp.set_defaults(func=cmd_servers)
 
-    sp = sub.add_parser("live", help="live mtr-style traceroute, updating in place")
+    sp = add_subparser("live", help="live mtr-style traceroute, updating in place")
     sp.add_argument("target", nargs="?", default="1.1.1.1")
     sp.add_argument("--port", type=int, default=None)
     sp.add_argument("--max-hops", type=int, default=20)
@@ -927,7 +947,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="where to save reports (default: the data dir)")
     sp.set_defaults(func=cmd_live)
 
-    sp = sub.add_parser("trace", help="mtr-style traceroute to a host")
+    sp = add_subparser("trace", help="mtr-style traceroute to a host")
     sp.add_argument("target")
     sp.add_argument("--port", type=int, default=None)
     sp.add_argument("--max-hops", type=int, default=20)
@@ -937,10 +957,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_trace)
 
-    sp = sub.add_parser("doctor", help="check what this environment supports")
+    sp = add_subparser("doctor", help="check what this environment supports")
     sp.set_defaults(func=cmd_doctor)
 
-    sp = sub.add_parser("watch", help="re-test on a timer and show a trend")
+    sp = add_subparser("watch", help="re-test on a timer and show a trend")
     add_common(sp)
     sp.add_argument("--interval", type=float, default=30.0,
                     help="seconds between tests")
@@ -950,7 +970,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="plain text output instead of the curses view")
     sp.set_defaults(func=cmd_watch)
 
-    sp = sub.add_parser("history", help="show past measurements and the trend")
+    sp = add_subparser("history", help="show past measurements and the trend")
     sp.add_argument("--limit", type=int, default=200,
                     help="how many history entries to load")
     sp.add_argument("--show", type=int, default=10,
@@ -960,7 +980,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_history)
 
-    sp = sub.add_parser("moo", help="moo")
+    sp = add_subparser("moo", help="moo")
     sp.add_argument("text", nargs="*", help="what the cow should say")
     sp.set_defaults(func=cmd_moo)
 

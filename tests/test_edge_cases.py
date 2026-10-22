@@ -505,6 +505,43 @@ def test_save_without_an_extension_gets_txt(tmp_path):
     assert (tmp_path / "plain.txt").is_file()
 
 
+@pytest.mark.parametrize("argv", [
+    ["--no-color", "speedtest"],
+    ["speedtest", "--no-color"],
+    ["live", "1.1.1.1", "--no-color"],
+    ["history", "--no-color"],
+])
+def test_global_flags_work_before_or_after_a_subcommand(argv):
+    from spdng.cli import build_parser
+
+    args = build_parser().parse_args(argv)
+
+    assert args.no_color is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["--theme", "mono", "speedtest"],
+    ["speedtest", "--theme", "mono"],
+    ["trace", "1.1.1.1", "--theme", "mono"],
+])
+def test_theme_works_before_or_after_a_subcommand(argv):
+    from spdng.cli import build_parser
+
+    args = build_parser().parse_args(argv)
+
+    assert args.theme == "mono"
+
+
+def test_global_flags_keep_the_parent_value_when_not_repeated():
+    from spdng.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["--no-fun", "--no-history", "speedtest"])
+
+    assert args.no_fun is True
+    assert args.no_history is True
+
+
 def test_compare_keeps_titles_aligned_when_a_provider_fails(monkeypatch):
     from spdng import cli
 
