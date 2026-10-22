@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The first public release.
 
+### Where it lives
+
+- GitHub: <https://github.com/patpadgett/spdng>
+- PyPI: <https://pypi.org/project/spdng/>
+- Homebrew: `brew install patpadgett/spdng/spdng`
+
 ### Added
 
 - **An mtr-style per-hop trace** to the test server, with loss, latency

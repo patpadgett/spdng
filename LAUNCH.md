@@ -1,10 +1,5 @@
 # spdng launch kit
 
-Everything here is written to be posted. Adjust the voice, but keep the
-numbers exactly as they are. They are all measured and all reproducible.
-
----
-
 ## 1. The upstream issue (sivel/speedtest-cli)
 
 The repo is archived and has issues disabled, so this cannot be filed
