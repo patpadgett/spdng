@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from spdng import frames, style, table
+from spdng import compare, frames, render, style, table
 from spdng.tui import (
     PROBE_ERROR,
     PROBE_OK,
@@ -298,13 +298,24 @@ def test_result_table_without_latency():
     assert "1800000" not in out
 
 
-@pytest.mark.xfail(strict=True, reason="skipped directions are still reported as zero")
 def test_skipped_download_is_not_a_fabricated_zero():
     r = _result()
     r.download_mbps = None
     out = frames.result_table(r)
     assert "skipped" in out.lower() or "n/a" in out.lower()
     assert "on fire" not in out.lower()
+
+
+def test_skipped_directions_are_explicit_in_every_summary():
+    r = _result()
+    r.download_mbps = None
+    r.upload_mbps = None
+
+    assert "skipped" in render.render_result(r).lower()
+    assert "skipped" in frames.result_table(r).lower()
+    assert "not measured" in frames.result_to_csv(r)
+    assert "n/a" in compare.render_comparison([r, _result()], ["a", "b"])
+    assert "skipped" in compare.render_repeat_comparison([r, _result()])
 
 
 def test_result_csv_has_a_header_and_rows():

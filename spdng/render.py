@@ -52,9 +52,15 @@ def bar(fraction: float, width: int = 30, fill: str = "█", empty: str = "░")
     return fill * filled + empty * (width - filled)
 
 
-def format_speed(download_mbps: float, upload_mbps: float) -> str:
-    return (f"Download: {c(f'{download_mbps:.2f}', 'bold')} Mbit/s   "
-            f"Upload: {c(f'{upload_mbps:.2f}', 'bold')} Mbit/s")
+def _speed(value: float | None) -> str:
+    return f"{c(f'{value:.2f}', 'bold')} Mbit/s" if value is not None \
+        else c("skipped", "muted")
+
+
+def format_speed(download_mbps: float | None,
+                 upload_mbps: float | None) -> str:
+    return (f"Download: {_speed(download_mbps)}   "
+            f"Upload: {_speed(upload_mbps)}")
 
 
 def render_result(result: SpeedTestResult, show_server: bool = True,
@@ -80,7 +86,7 @@ def render_result(result: SpeedTestResult, show_server: bool = True,
                    "   (latency probe failed; not reporting a placeholder)")
     out.append(format_speed(result.download_mbps, result.upload_mbps))
 
-    if fun:
+    if fun and result.download_mbps is not None:
         out.append("")
         out.append(f"  {funmod.render_speedometer(result.download_mbps)}")
         out.append(f"  Grade: {funmod.render_grade(result.download_mbps)}"

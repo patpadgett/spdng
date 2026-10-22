@@ -36,8 +36,8 @@ class HistoryEntry:
     timestamp: float
     provider: str = "ookla"
     server: str = ""
-    download_mbps: float = 0.0
-    upload_mbps: float = 0.0
+    download_mbps: float | None = None
+    upload_mbps: float | None = None
     ping_ms: float | None = None
     jitter_ms: float | None = None
     loss_pct: float | None = None
@@ -118,18 +118,22 @@ def trend(entries: list[HistoryEntry]) -> dict:
     """Summarise a set of entries: latest, average, and the direction."""
     if not entries:
         return {"count": 0}
-    dls = [e.download_mbps for e in entries]
+    dls = [e.download_mbps for e in entries if e.download_mbps is not None]
     latest = entries[-1]
     result = {
         "count": len(entries),
         "latest": latest,
         "first": entries[0],
+    }
+    if not dls:
+        return result
+    result.update({
         "download_min": min(dls),
         "download_max": max(dls),
         "download_avg": sum(dls) / len(dls),
-    }
-    if len(entries) >= 2:
-        half = max(1, len(entries) // 2)
+    })
+    if len(dls) >= 2:
+        half = max(1, len(dls) // 2)
         early = sum(dls[:half]) / half
         late = sum(dls[half:]) / (len(dls) - half)
         result["early_avg"] = early

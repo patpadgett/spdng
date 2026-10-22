@@ -41,20 +41,22 @@ def result_table(result, fun_on: bool = True) -> str:
                         "muted"),
         ])
 
-    t.add_row([
-        "Download",
-        style.paint(f"{result.download_mbps:.2f} Mbit/s", "good"),
-        f"{result.download_detail.bytes_transferred / 1e6:.1f} MB in "
-        f"{result.download_detail.seconds:.1f}s",
-    ])
-    t.add_row([
-        "Upload",
-        style.paint(f"{result.upload_mbps:.2f} Mbit/s", "ok"),
-        f"{result.upload_detail.bytes_transferred / 1e6:.1f} MB in "
-        f"{result.upload_detail.seconds:.1f}s",
-    ])
+    for label, value, detail, role in (
+        ("Download", result.download_mbps, result.download_detail, "good"),
+        ("Upload", result.upload_mbps, result.upload_detail, "ok"),
+    ):
+        if value is None:
+            t.add_row([label, style.paint("skipped", "muted"),
+                       "not measured"])
+            continue
+        t.add_row([
+            label,
+            style.paint(f"{value:.2f} Mbit/s", role),
+            f"{detail.bytes_transferred / 1e6:.1f} MB in "
+            f"{detail.seconds:.1f}s",
+        ])
 
-    if fun_on:
+    if fun_on and result.download_mbps is not None:
         from . import fun as funmod
         letter, word = funmod.grade_for(result.download_mbps)
         t.add_row(["Grade", style.paint(letter, "good"),
@@ -90,8 +92,12 @@ def comparison_table(results, titles) -> str:
     rows.append(provs)
     rows.append(dists)
 
-    rows.append([f"{r.download_mbps:.2f} Mbit/s" for r in results])
-    rows.append([f"{r.upload_mbps:.2f} Mbit/s" for r in results])
+    rows.append([
+        f"{r.download_mbps:.2f} Mbit/s" if r.download_mbps is not None
+        else "n/a" for r in results])
+    rows.append([
+        f"{r.upload_mbps:.2f} Mbit/s" if r.upload_mbps is not None
+        else "n/a" for r in results])
     rows.append([
         f"{r.latency.avg_ms:.2f} ms" if r.latency.avg_ms is not None else "n/a"
         for r in results])
@@ -202,12 +208,24 @@ def result_to_csv(result) -> str:
     writer.writerow(["jitter", f"{lat.jitter_ms:.4f}"
                      if lat.jitter_ms is not None else "", "ms", ""])
     writer.writerow(["loss", f"{lat.loss_pct:.2f}", "%", ""])
-    writer.writerow(["download", f"{result.download_mbps:.4f}", "Mbit/s",
-                     f"{result.download_detail.bytes_transferred} bytes in "
-                     f"{result.download_detail.seconds:.3f}s"])
-    writer.writerow(["upload", f"{result.upload_mbps:.4f}", "Mbit/s",
-                     f"{result.upload_detail.bytes_transferred} bytes in "
-                     f"{result.upload_detail.seconds:.3f}s"])
+    writer.writerow([
+        "download",
+        f"{result.download_mbps:.4f}" if result.download_mbps is not None
+        else "",
+        "Mbit/s",
+        (f"{result.download_detail.bytes_transferred} bytes in "
+         f"{result.download_detail.seconds:.3f}s")
+        if result.download_mbps is not None else "not measured",
+    ])
+    writer.writerow([
+        "upload",
+        f"{result.upload_mbps:.4f}" if result.upload_mbps is not None
+        else "",
+        "Mbit/s",
+        (f"{result.upload_detail.bytes_transferred} bytes in "
+         f"{result.upload_detail.seconds:.3f}s")
+        if result.upload_mbps is not None else "not measured",
+    ])
     for i, sample in enumerate(lat.samples_ms):
         writer.writerow([f"ping_sample_{i}", f"{sample:.4f}", "ms", ""])
     return buf.getvalue()

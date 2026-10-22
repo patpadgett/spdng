@@ -26,8 +26,8 @@ class WatchSample:
     """One measurement in the watch session."""
 
     timestamp: float
-    download_mbps: float
-    upload_mbps: float
+    download_mbps: float | None
+    upload_mbps: float | None
     ping_ms: float | None
     provider: str = ""
     server: str = ""
@@ -85,18 +85,23 @@ class WatchView:
             rows.append("".join(line))
         return rows
 
-    def _stat_line(self, label: str, unit: str, peak: float, last: float,
-                   avg: float, width: int = 0) -> str:
+    def _stat_line(self, label: str, unit: str, peak: float | None,
+                   last: float | None, avg: float | None,
+                   width: int = 0) -> str:
         """A padded summary line, so the numbers sit under each other.
 
         The line is trimmed to fit the terminal: the "avg" field goes
         first, because peak and last are the numbers you read.
         """
         from .table import pad
+
+        def value(number: float | None) -> str:
+            return f"{number:>8.1f}" if number is not None else "     n/a"
+
         parts = [
-            f"    {pad('peak', 10)}{peak:>8.1f} {unit}",
-            f"   {pad('last', 6)}{last:>8.1f}",
-            f"   {pad('avg', 5)}{avg:>8.1f}",
+            f"    {pad('peak', 10)}{value(peak)} {unit}",
+            f"   {pad('last', 6)}{value(last)}",
+            f"   {pad('avg', 5)}{value(avg)}",
         ]
         line = parts[0]
         for extra in parts[1:]:
@@ -147,11 +152,13 @@ class WatchView:
             out.append(self._footer(width))
             return out
 
-        dls = [s.download_mbps for s in self.samples]
+        dls = [s.download_mbps for s in self.samples
+               if s.download_mbps is not None]
         pings = [s.ping_ms for s in self.samples if s.ping_ms is not None]
-        ups = [s.upload_mbps for s in self.samples]
-        peak_dl = max(dls) or 1
-        peak_up = max(ups) or 1
+        ups = [s.upload_mbps for s in self.samples
+               if s.upload_mbps is not None]
+        peak_dl = max(dls) if dls else None
+        peak_up = max(ups) if ups else None
         peak_ping = max(pings) if pings else 1
 
         # The graph takes the whole width, less room for the label.
@@ -159,22 +166,30 @@ class WatchView:
 
         # Download bar graph
         out.append(style.paint("  Download", "heading"))
-        out.append(self._stat_line("Download", "Mbit/s", peak_dl, dls[-1],
-                                   sum(dls) / len(dls), width))
-        bar = self._bar(dls[-1], peak_dl, graph_width)
-        out.append("    " + style.paint(bar, "accent")
-                   + f" {dls[-1]:>7.1f} Mbit/s")
+        if dls:
+            out.append(self._stat_line(
+                "Download", "Mbit/s", peak_dl, dls[-1],
+                sum(dls) / len(dls), width))
+            bar = self._bar(dls[-1], peak_dl or 1, graph_width)
+            out.append("    " + style.paint(bar, "accent")
+                       + f" {dls[-1]:>7.1f} Mbit/s")
+        else:
+            out.append(style.paint("    skipped", "muted"))
         out.append("")
 
         # Upload stat bar. This always shows: it is the current upload
         # rate, which is worth seeing. The "u" key toggles the
         # TIME-BASED upload chart at the bottom, not this.
         out.append(style.paint("  Upload", "heading"))
-        out.append(self._stat_line("Upload", "Mbit/s", peak_up, ups[-1],
-                                   sum(ups) / len(ups), width))
-        bar = self._bar(ups[-1], peak_up, graph_width)
-        out.append("    " + style.paint(bar, "ok")
-                   + f" {ups[-1]:>7.1f} Mbit/s")
+        if ups:
+            out.append(self._stat_line(
+                "Upload", "Mbit/s", peak_up, ups[-1],
+                sum(ups) / len(ups), width))
+            bar = self._bar(ups[-1], peak_up or 1, graph_width)
+            out.append("    " + style.paint(bar, "ok")
+                       + f" {ups[-1]:>7.1f} Mbit/s")
+        else:
+            out.append(style.paint("    skipped", "muted"))
         out.append("")
 
         # Ping bar graph, inverted: lower is better, so we show "how bad is
@@ -350,7 +365,8 @@ def save_csv(samples: list[WatchSample], path: str) -> str:
                 f"{s.timestamp:.3f}",
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s.timestamp)),
                 s.provider, s.server,
-                f"{s.download_mbps:.3f}", f"{s.upload_mbps:.3f}",
+                f"{s.download_mbps:.3f}" if s.download_mbps is not None else "",
+                f"{s.upload_mbps:.3f}" if s.upload_mbps is not None else "",
                 f"{s.ping_ms:.3f}" if s.ping_ms is not None else "",
             ])
     return path
@@ -378,7 +394,8 @@ def save_json(samples: list[WatchSample], path: str) -> str:
 
 
 def save_report(samples: list[WatchSample], path: str, target: str) -> str:
-    dls = [s.download_mbps for s in samples]
+    dls = [s.download_mbps for s in samples
+           if s.download_mbps is not None]
     pings = [s.ping_ms for s in samples if s.ping_ms is not None]
     lines = [
         "spdng watch report",
@@ -398,10 +415,15 @@ def save_report(samples: list[WatchSample], path: str, target: str) -> str:
         ]
     lines += ["", "timestamp              download   upload   ping"]
     for s in samples:
+        down = f"{s.download_mbps:>8.2f}" if s.download_mbps is not None \
+            else f"{'n/a':>8}"
+        up = f"{s.upload_mbps:>6.2f}" if s.upload_mbps is not None \
+            else f"{'n/a':>6}"
+        ping = f"{s.ping_ms:>6.2f}" if s.ping_ms is not None \
+            else f"{'n/a':>6}"
         lines.append(
             f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s.timestamp))}"
-            f"  {s.download_mbps:>8.2f}  {s.upload_mbps:>6.2f}  "
-            f"{s.ping_ms if s.ping_ms is not None else 0:>6.2f}")
+            f"  {down}  {up}  {ping}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     return path

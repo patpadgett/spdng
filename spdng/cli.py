@@ -747,18 +747,26 @@ def cmd_history(args) -> int:
     for e in entries[-args.show:]:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.timestamp))
         ping = f"{e.ping_ms:6.1f} ms" if e.ping_ms is not None else "     n/a"
+        down = (style.paint(f"{e.download_mbps:>8.2f}", "good")
+                if e.download_mbps is not None
+                else style.paint(f"{'n/a':>8}", "muted"))
+        up = (style.paint(f"{e.upload_mbps:>6.2f}", "ok")
+              if e.upload_mbps is not None
+              else style.paint(f"{'n/a':>6}", "muted"))
         print(f"  {when}  {e.provider:<12} "
-              f"{style.paint(f'{e.download_mbps:>8.2f}', 'good')} Mbit/s down  "
-              f"{style.paint(f'{e.upload_mbps:>6.2f}', 'ok')} Mbit/s up  "
-              f"ping {ping}")
+              f"{down} Mbit/s down  {up} Mbit/s up  ping {ping}")
 
     t = history.trend(entries)
     print()
-    downloads = [e.download_mbps for e in entries]
-    print(f"  {style.paint('range', 'dim')}: "
-          f"{t['download_min']:.1f} .. {t['download_max']:.1f} Mbit/s "
-          f"(avg {t['download_avg']:.1f})")
-    print(f"  {fun.sparkline_history(downloads)}")
+    downloads = [e.download_mbps for e in entries
+                 if e.download_mbps is not None]
+    if "download_min" in t:
+        print(f"  {style.paint('range', 'dim')}: "
+              f"{t['download_min']:.1f} .. {t['download_max']:.1f} Mbit/s "
+              f"(avg {t['download_avg']:.1f})")
+        print(f"  {fun.sparkline_history(downloads)}")
+    else:
+        print(f"  {style.paint('range', 'dim')}: no download measurements")
     if "change_pct" in t:
         change = t["change_pct"]
         role = "good" if change >= 0 else "bad"

@@ -200,7 +200,7 @@ def test_json_output_never_contains_ansi():
 def test_json_output_is_valid_for_an_empty_result():
     r = measure.SpeedTestResult(server=None)
     payload = r.to_dict()
-    assert json.loads(json.dumps(payload))["download_mbps"] == 0.0
+    assert json.loads(json.dumps(payload))["download_mbps"] is None
 
 
 def test_latency_loss_is_never_above_one_hundred_percent():

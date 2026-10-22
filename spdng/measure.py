@@ -100,8 +100,11 @@ class ThroughputResult:
 @dataclass(slots=True)
 class SpeedTestResult:
     server: object = None
-    download_mbps: float = 0.0
-    upload_mbps: float = 0.0
+    #: None means the direction was not measured (for example because the
+    #: user passed --no-download). It is deliberately different from 0.0,
+    #: which is a real transfer that moved no bytes.
+    download_mbps: float | None = None
+    upload_mbps: float | None = None
     latency: LatencyResult = field(default_factory=LatencyResult)
     download_detail: ThroughputResult = field(default_factory=ThroughputResult)
     upload_detail: ThroughputResult = field(default_factory=ThroughputResult)
@@ -117,8 +120,10 @@ class SpeedTestResult:
             "server": srv,
             "provider": self.provider,
             "provider_label": self.provider_label,
-            "download_mbps": round(self.download_mbps, 2),
-            "upload_mbps": round(self.upload_mbps, 2),
+            "download_mbps": (round(self.download_mbps, 2)
+                              if self.download_mbps is not None else None),
+            "upload_mbps": (round(self.upload_mbps, 2)
+                            if self.upload_mbps is not None else None),
             "latency": {
                 "avg_ms": self.latency.avg_ms,
                 "min_ms": self.latency.min_ms,

@@ -137,12 +137,15 @@ def render_comparison(results: Sequence[SpeedTestResult],
             deltas = [_delta(v, base, higher_is_better=better) for v in values]
             out.append(row(label, deltas))
 
-    if show_bars and downloads and max(downloads) > 0:
-        best = max(downloads)
+    known_downloads = [v for v in downloads if v is not None]
+    if show_bars and known_downloads and max(known_downloads) > 0:
+        best = max(known_downloads)
         out.append("")
         out.append(style.paint(f"{'':<{label_w}}Download, relative to best",
                                 "dim"))
         for t, v in zip(titles, downloads, strict=False):
+            if v is None:
+                continue
             frac = v / best
             bar = "█" * max(1, int(round(frac * 20)))
             out.append(f"{'':<{label_w}}{t[:col_w - 1]:<{col_w}}"
@@ -178,8 +181,11 @@ def render_repeat_comparison(runs: Sequence[SpeedTestResult],
                      "somewhat variable" if spread < 25 else "very variable")
         out.append(f"  {name}:")
         for i, v in enumerate(values):
+            if v is None:
+                out.append(f"    run {i + 1}: {'skipped':>10} {unit:<8}")
+                continue
             bar_val = ""
-            if v is not None and hi > lo:
+            if hi > lo:
                 bar_val = " " * int(round((v - lo) / (hi - lo) * 24))
             out.append(f"    run {i + 1}: {v:>10.2f} {unit:<8} "
                        f"{style.paint(bar_val, 'accent')}")
