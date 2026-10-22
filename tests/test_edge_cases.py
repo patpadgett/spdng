@@ -542,6 +542,35 @@ def test_global_flags_keep_the_parent_value_when_not_repeated():
     assert args.no_history is True
 
 
+def test_custom_server_url_skips_the_public_server_list(monkeypatch):
+    from spdng import cli
+
+    class Provider:
+        id = "librespeed"
+        label = "LibreSpeed"
+
+        def list_servers(self, limit=10):
+            raise AssertionError("public list should not be fetched")
+
+    monkeypatch.setattr(
+        cli, "_set_origin",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("origin lookup should not run")))
+    args = SimpleNamespace(
+        server="https://speed.example/backend/",
+        limit=20,
+        max_distance=0.0,
+    )
+
+    server, error = cli._pick_server(Provider(), args)
+
+    assert error is None
+    assert server is not None
+    assert server.host == "speed.example"
+    assert server.url == "https://speed.example/backend"
+    assert server.provider == "librespeed"
+
+
 def test_compare_keeps_titles_aligned_when_a_provider_fails(monkeypatch):
     from spdng import cli
 

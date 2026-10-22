@@ -62,6 +62,19 @@ def _set_origin(provider, args) -> None:
 
 def _pick_server(provider, args) -> tuple[servers.Server | None, str | None]:
     """Pick the server to test against."""
+    # A URL means "use this exact server", which is how you point at a
+    # LibreSpeed instance you run yourself. Do this before asking the
+    # provider for its public list: a custom instance is often the reason
+    # the list endpoint is unreachable in the first place.
+    if args.server and args.server.lower().startswith(("http://", "https://")):
+        url = args.server.rstrip("/")
+        host = url.split("//", 1)[-1].split("/")[0]
+        return servers.Server(
+            id="custom", host=host, sponsor="Custom", name=url,
+            country="", cc="", lat=0.0, lon=0.0, distance_km=0.0,
+            url=url, provider=provider.id,
+        ), None
+
     _set_origin(provider, args)
     candidates = provider.list_servers(limit=max(10, args.limit))
 
@@ -74,16 +87,6 @@ def _pick_server(provider, args) -> tuple[servers.Server | None, str | None]:
             if (needle in s.host.lower() or needle in s.name.lower()
                     or needle in s.sponsor.lower()):
                 return s, None
-        # A URL means "use this exact server", which is how you point at a
-        # LibreSpeed instance you run yourself.
-        if args.server.lower().startswith(("http://", "https://")):
-            url = args.server.rstrip("/")
-            host = url.split("//", 1)[-1].split("/")[0]
-            return servers.Server(
-                id="custom", host=host, sponsor="Custom", name=url,
-                country="", cc="", lat=0.0, lon=0.0, distance_km=0.0,
-                url=url, provider=provider.id,
-            ), None
         return None, f"no server matched {args.server!r}"
 
     if args.max_distance > 0:
