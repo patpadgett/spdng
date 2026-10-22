@@ -596,8 +596,11 @@ def cmd_watch(args) -> int:
         return result
 
     if args.plain:
-        results = watch.watch(run_once, interval=args.interval,
-                               duration=args.watch_duration)
+        results = watch.watch(
+            run_once, interval=args.interval,
+            duration=args.watch_duration,
+            clear=sys.stdout.isatty(),
+            show_frames=not args.json)
         if not results:
             return 1
         if args.json:
@@ -672,7 +675,11 @@ def _watch_curses(run_once, provider, server, args) -> int:
                 if kind == "error":
                     view.set_status("error", str(payload))
                     busy = False
-                    break
+                    # Retry after the normal interval rather than
+                    # exiting the watch session on one transient
+                    # failure.
+                    next_run = time.time() + interval
+                    continue
                 result = payload
                 busy = False
                 sample = WatchSample(
@@ -726,8 +733,6 @@ def _watch_curses(run_once, provider, server, args) -> int:
                                 f"{'shown' if view.show_upload else 'hidden'}")
 
             if args.watch_duration and (time.time() - started) >= args.watch_duration:
-                break
-            if view.status == "error":
                 break
 
             # Start the next sample when it is due, and only if one is

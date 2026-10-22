@@ -17,6 +17,8 @@ from .measure import SpeedTestResult
 
 
 def _clear_line() -> None:
+    if not sys.stdout.isatty():
+        return
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
 
@@ -35,7 +37,7 @@ def render_watch_frame(results: list[SpeedTestResult], interval: float,
         parts.append(
             f"{style.paint(dl_text, 'good')} Mbit/s down  "
             f"{style.paint(up_text, 'ok')} Mbit/s up  "
-            f"ping {style.paint(f'{ping:>6.1f}', 'value') if ping else '   n/a'} ms"
+            f"ping {style.paint(f'{ping:>6.1f}', 'value') if ping is not None else '   n/a'} ms"
         )
         if len(results) > 1:
             history = [r.download_mbps for r in results
@@ -48,11 +50,16 @@ def render_watch_frame(results: list[SpeedTestResult], interval: float,
 
 
 def watch(run_once: Callable[[], SpeedTestResult], interval: float = 30.0,
-          duration: float = 0.0, clear: bool = True) -> list[SpeedTestResult]:
+          duration: float = 0.0, clear: bool = True,
+          show_frames: bool = True) -> list[SpeedTestResult]:
     """Run `run_once` on a loop, printing a live frame each time.
 
-    duration of 0 means run until interrupted.
+    duration of 0 means run until interrupted. A failed sample is reported
+    and retried after the interval; one bad cycle must not end a watch
+    session. `clear` only emits terminal escapes when stdout is a TTY, so
+    redirected output stays free of carriage returns and escape codes.
     """
+    clear = clear and sys.stdout.isatty()
     results: list[SpeedTestResult] = []
     started = time.perf_counter()
     try:
@@ -60,18 +67,32 @@ def watch(run_once: Callable[[], SpeedTestResult], interval: float = 30.0,
             if duration and (time.perf_counter() - started) >= duration:
                 break
             cycle_start = time.perf_counter()
-            result = run_once()
+            try:
+                result = run_once()
+            except Exception as exc:  # noqa: BLE001
+                print(f"spdng: watch sample failed: {exc}", file=sys.stderr)
+                elapsed_in_cycle = time.perf_counter() - cycle_start
+                sleep_for = max(0.0, interval - elapsed_in_cycle)
+                if duration:
+                    sleep_for = min(
+                        sleep_for,
+                        duration - (time.perf_counter() - started))
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                continue
+
             results.append(result)
             elapsed_in_cycle = time.perf_counter() - cycle_start
-            if clear:
-                _clear_line()
-            next_in = max(0.0, interval - elapsed_in_cycle)
-            frame = render_watch_frame(results, interval, next_in)
-            sys.stdout.write(frame + "\n")
-            sys.stdout.flush()
+            if show_frames:
+                if clear:
+                    _clear_line()
+                next_in = max(0.0, interval - elapsed_in_cycle)
+                frame = render_watch_frame(results, interval, next_in)
+                sys.stdout.write(frame + "\n")
+                sys.stdout.flush()
 
-            if clear:
-                _clear_line()
+                if clear:
+                    _clear_line()
             sleep_for = max(0.0, interval - elapsed_in_cycle)
             if duration:
                 sleep_for = min(sleep_for,
