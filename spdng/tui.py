@@ -522,6 +522,15 @@ class LiveTraceView:
         #: The width of the screen, set when the view is drawn. The
         #: separator rule is capped to it so it never wraps.
         self._screen_width = 0
+        #: The height of the screen, set when the view is drawn. It limits
+        #: the hop window so a long path does not push the footer off.
+        self._screen_height = 0
+        #: First hop shown when the path is taller than the window.
+        self._scroll = 0
+
+    def scroll(self, delta: int) -> None:
+        """Move the visible hop window up or down."""
+        self._scroll = max(0, self._scroll + delta)
 
     def update_hop(self, ttl: int, address: str | None, rtt_ms: float | None,
                    outcome: str, sent: int, received: int) -> None:
@@ -563,7 +572,9 @@ class LiveTraceView:
 
     def render(self, screen: Screen) -> list[str]:
         """Build the frame and draw it."""
-        self._screen_width = screen.size()[1]
+        height, width = screen.size()
+        self._screen_height = height
+        self._screen_width = width
         lines = self.render_lines()
         screen.print_frame(lines)
         return lines
@@ -669,7 +680,18 @@ class LiveTraceView:
             rule_len = screen_width - 1
         out.append(style.paint(" " + "-" * rule_len, "muted"))
 
-        for hop in self.hops:
+        start = 0
+        end = len(self.hops)
+        if self._screen_height:
+            # Title, optional message, blank, header, rule, blank, footer.
+            reserved = 6 + (1 if self.message else 0)
+            visible = max(1, self._screen_height - reserved)
+            max_scroll = max(0, len(self.hops) - visible)
+            self._scroll = min(self._scroll, max_scroll)
+            start = self._scroll
+            end = start + visible
+
+        for hop in self.hops[start:end]:
             loss = self._loss_pct(hop)
             samples = hop["samples"]
             avg = sum(samples) / len(samples) if samples else None

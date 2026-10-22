@@ -149,30 +149,42 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
         return [r for r in results if r is not None]
 
     def worker():
-        while not stop.is_set():
-            try:
-                results = probe_round()
-            except Exception:  # noqa: BLE001
-                return
-            if stop.is_set():
-                return
+        try:
+            results = probe_round()
+        except Exception:  # noqa: BLE001
+            results = []
+        if not stop.is_set():
             results_queue.put(results)
 
     with Screen("spdng live trace", keep_output=True) as screen:
-        threading.Thread(target=worker, daemon=True).start()
+        probing = False
+        next_round_at = time.monotonic()
         while not should_quit:
             view._round = round_no
+            now = time.monotonic()
 
-            # Take any round that has finished.
+            # Probe only when the previous round has finished, the user
+            # is not paused, and the requested interval has elapsed. A
+            # worker thread keeps keys responsive while probes are in
+            # flight; the main loop never starts a second round.
+            if not paused and not probing and now >= next_round_at:
+                probing = True
+                threading.Thread(target=worker, daemon=True).start()
+
+            # Take any round that has finished. Results are recorded even
+            # if the user paused while the round was in flight; pause
+            # stops new probing, it does not throw away what was measured.
             try:
                 results = results_queue.get_nowait()
             except queue.Empty:
                 results = None
 
-            if results is not None and not paused:
-                # sent/received ACCUMULATE across rounds. The view tracks
-                # them per hop; these dicts are the running totals.
+            if results is not None:
+                probing = False
                 for ttl, addr, rtt, outcome in results:
+                    # sent/received ACCUMULATE across rounds. The view
+                    # tracks them per hop; these dicts are the running
+                    # totals.
                     sent[ttl] = sent.get(ttl, 0) + 1
                     if outcome == PROBE_OK:
                         received[ttl] = received.get(ttl, 0) + 1
@@ -182,12 +194,13 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
                 # Stop probing beyond the first hop that is clearly dead,
                 # because everything past it measures nothing.
                 dead_at = _first_dead(view)
-                if dead_at:
+                if dead_at and not paused:
                     view.set_status(
                         "running",
                         f"hop {dead_at} is not responding; "
                         f"hops beyond it are not being measured")
                 round_no += 1
+                next_round_at = time.monotonic() + current_interval
 
             screen.resized()
             view.render(screen)
@@ -209,22 +222,31 @@ def run_live_trace(target: str, port: int = 33434, max_hops: int = 20,
                 view.set_status("running", f"saved {path}")
             elif key == "SPACE":
                 paused = not paused
+                if not paused:
+                    # Do not wait out the interval that was already
+                    # running while the view was paused.
+                    next_round_at = time.monotonic()
                 view.set_status("paused" if paused else "running")
             elif key == "+":
                 current_interval = max(0.1, current_interval - 0.1)
                 view.set_status("running",
                                 f"interval {current_interval:.1f}s")
+                if not probing:
+                    next_round_at = time.monotonic() + current_interval
             elif key == "-":
                 current_interval = min(10.0, current_interval + 0.1)
                 view.set_status("running",
                                 f"interval {current_interval:.1f}s")
+                if not probing:
+                    next_round_at = time.monotonic() + current_interval
             elif key == "UP":
-                view._scroll = max(0, getattr(view, "_scroll", 0) - 1)
+                view.scroll(-1)
             elif key == "DOWN":
-                view._scroll = getattr(view, "_scroll", 0) + 1
+                view.scroll(1)
 
-            if not paused:
-                time.sleep(min(current_interval, 0.05))
+            # Keep the loop responsive for keys. The interval is enforced
+            # by next_round_at, not by sleeping here.
+            time.sleep(0.05)
 
             if rounds and round_no >= rounds:
                 should_quit = True

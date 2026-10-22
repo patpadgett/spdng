@@ -244,6 +244,130 @@ def test_live_view_with_no_hops():
     assert lines
 
 
+def test_live_view_scrolls_the_visible_hop_window():
+    v = LiveTraceView("1.1.1.1")
+    for ttl in range(1, 13):
+        v.update_hop(ttl, f"host{ttl:02d}.example", 1.0, PROBE_OK, 1, 1)
+    # Six lines of chrome leave four hop rows on a ten-line screen.
+    v._screen_height = 10
+
+    v.scroll(5)
+    text = "\n".join(v.render_lines())
+    assert "host06.example" in text
+    assert "host09.example" in text
+    assert "host05.example" not in text
+    assert "host10.example" not in text
+
+    v.scroll(100)
+    v.render_lines()
+    assert v._scroll == 8
+    assert "host12.example" in "\n".join(v.render_lines())
+
+    v.scroll(-100)
+    v.render_lines()
+    assert v._scroll == 0
+    assert "host01.example" in "\n".join(v.render_lines())
+
+
+def test_live_trace_waits_between_probe_rounds(monkeypatch):
+    import time
+
+    from spdng import live
+
+    probe_times = []
+
+    class FakeScreen:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def size(self):
+            return 24, 80
+
+        def resized(self):
+            return False
+
+        def print_frame(self, lines):
+            pass
+
+        def getch(self, timeout):
+            return -1
+
+    def fake_probe(*args, **kwargs):
+        probe_times.append(time.monotonic())
+        return 1, "127.0.0.1", 1.0, live.PROBE_OK
+
+    monkeypatch.setattr(live, "Screen", FakeScreen)
+    monkeypatch.setattr(live, "probe_hop", fake_probe)
+
+    rc = live.run_live_trace(
+        "127.0.0.1", max_hops=1, interval=0.2, rounds=3, method="icmp")
+
+    assert rc == 0
+    assert len(probe_times) == 3
+    gaps = [b - a for a, b in zip(
+        probe_times, probe_times[1:], strict=False)]
+    assert all(gap >= 0.15 for gap in gaps), gaps
+
+
+def test_live_trace_pause_stops_new_probe_rounds(monkeypatch):
+    from spdng import live
+
+    probe_calls = []
+    state = {}
+
+    class FakeScreen:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def size(self):
+            return 24, 80
+
+        def resized(self):
+            return False
+
+        def print_frame(self, lines):
+            pass
+
+        def getch(self, timeout):
+            self.calls += 1
+            if self.calls == 2:
+                state["at_pause"] = len(probe_calls)
+                return ord(" ")
+            if self.calls >= 12:
+                return ord("q")
+            return -1
+
+    def fake_probe(*args, **kwargs):
+        probe_calls.append(1)
+        return 1, "127.0.0.1", 1.0, live.PROBE_OK
+
+    monkeypatch.setattr(live, "Screen", FakeScreen)
+    monkeypatch.setattr(live, "probe_hop", fake_probe)
+
+    rc = live.run_live_trace(
+        "127.0.0.1", max_hops=1, interval=0.05, rounds=0, method="icmp")
+
+    assert rc == 0
+    # A round already in flight when space is pressed may finish, but no
+    # new round starts while the view is paused.
+    assert state["at_pause"] <= 1
+    assert len(probe_calls) <= state["at_pause"] + 1
+
+
 def test_live_view_status_message():
     v = _view()
     v.set_status("paused", "waiting")
