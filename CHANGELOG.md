@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-22
+
+A remediation release for the issues found in the 0.7.0 audit.
+
+### Added
+
+- **Unprivileged ICMP tracing.** On Linux, a `SOCK_DGRAM` ICMP socket with
+  `IP_RECVERR` gives per-hop replies without `CAP_NET_RAW` or a setuid
+  binary. It is preferred after raw ICMP and before the `ping` binary.
+- **`--method` and `--port`** for `spdng trace` and `spdng live`, so you can
+  force `icmp`, `icmp-dgram`, `ping`, or `udp`, and choose the destination
+  port.
+- **IPv6 support** for trace targets, including IPv6 literals, `host:port`,
+  and URLs.
+- **Approximate-RTT markers.** RTTs estimated from a `ping` invocation are
+  rendered with `~`; the destination hop keeps the kernel-measured value.
+- **A local HTTP test harness** and worker-contract tests for download and
+  upload loops, HTTP errors, and persistent latency connections.
+
+### Fixed
+
+- **Transfers run for the whole measurement window.** A worker finishing
+  early no longer ends the test for every thread.
+- **LibreSpeed latency URLs keep their query separator**, so probes no
+  longer hit a malformed endpoint.
+- **UDP traceroute attributes ICMP errors to the router that sent them** and
+  no longer mistakes a local `ECONNREFUSED` for arrival at the destination.
+- **Live timeouts are failures, not zero-latency successes.**
+- **Skipped values are absent, not zero.** `--no-upload`, `--no-download`,
+  and `--no-latency` render as `skipped` or `n/a`; JSON reports `null`
+  rather than a fabricated `0.0` or 100% loss.
+- **`--server URL` is resolved before** any origin lookup or fetch of the
+  public server list.
+- **`--save PATH` is honoured exactly.** Missing extensions get `.txt`, a
+  relative path is placed inside `--save-dir`, and a directory gets a
+  timestamped result file.
+- **Global flags work before or after the subcommand.**
+- **Comparison labels and relative bars stay aligned**, including truncated
+  server names and missing values.
+- **Narrow watch layouts stack the charts** below 50 columns.
+- **`watch --plain` keeps redirected output clean** and retries failed
+  samples.
+- **Live rounds respect `--interval`, paused views stop probing, and
+  scrolling works.**
+- **Trace failures surface properly**: resolution errors exit 2, and a
+  failed or incomplete trace exits 1.
+- **Colour padding and semantic style roles are consistent** across tables
+  and the curses UI.
+- **Invalid numeric options are rejected** instead of being silently
+  coerced.
+- **`--no-latency --json` reports null latency and loss**, not 100% loss.
+
+### Changed
+
+- Packaging now uses PEP 639 license metadata with `setuptools>=77.0.3`,
+  advertises Python 3.14, and installs `pyte` with the `dev` extra.
+- GitHub Actions are pinned to commit SHAs, and the wheel is built and
+  install-checked before publishing to PyPI.
+- README examples and option tables were regenerated against the current
+  output, including skipped values, approximate RTTs, saving, history,
+  watch, compare, and traceroute backends.
+
 ## [0.7.0] - 2026-10-21
 
 The first public release.
@@ -71,5 +133,6 @@ Each one is reproducible with `proof.py` in the repository root.
 - The name is distinct from `speedtest-cli` on purpose: the original
   author owns that name, and this is a different tool.
 
-[Unreleased]: https://github.com/patpadgett/spdng/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/patpadgett/spdng/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/patpadgett/spdng/releases/tag/v0.8.0
 [0.7.0]: https://github.com/patpadgett/spdng/releases/tag/v0.7.0
