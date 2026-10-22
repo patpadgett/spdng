@@ -323,22 +323,43 @@ def test_render_trace_has_mtr_style_columns():
 
 
 def test_render_loss_summary_flags_final_hop_loss():
-    t = traceroute.TraceResult(hops=[
-        traceroute.Hop(ttl=1, sent=3, received=3, rtts_ms=[5.0, 5.0, 5.0]),
-        traceroute.Hop(ttl=2, sent=3, received=1, rtts_ms=[9.0]),
-    ])
+    t = traceroute.TraceResult(
+        destination_reached=True,
+        hops=[
+            traceroute.Hop(ttl=1, sent=3, received=3,
+                           rtts_ms=[5.0, 5.0, 5.0]),
+            traceroute.Hop(ttl=2, sent=3, received=1, rtts_ms=[9.0]),
+        ])
     out = render.render_loss_summary(t)
     assert "lossy" in out
 
 
 def test_render_loss_summary_flags_latency_jump():
-    t = traceroute.TraceResult(hops=[
-        traceroute.Hop(ttl=1, sent=3, received=3, rtts_ms=[5.0, 5.0, 5.0]),
-        traceroute.Hop(ttl=2, sent=3, received=3, rtts_ms=[200.0, 200.0, 200.0]),
-    ])
+    t = traceroute.TraceResult(
+        destination_reached=True,
+        hops=[
+            traceroute.Hop(ttl=1, sent=3, received=3,
+                           rtts_ms=[5.0, 5.0, 5.0]),
+            traceroute.Hop(ttl=2, sent=3, received=3,
+                           rtts_ms=[200.0, 200.0, 200.0]),
+        ])
     out = render.render_loss_summary(t)
     assert "Latency jump" in out
     assert "hop 2" in out
+
+
+def test_render_loss_summary_does_not_call_an_unreached_hop_final():
+    t = traceroute.TraceResult(
+        target="192.0.2.1", destination_reached=False,
+        hops=[
+            traceroute.Hop(ttl=1, addr="10.0.0.1", sent=3, received=3,
+                           rtts_ms=[1.0, 1.0, 1.0]),
+            traceroute.Hop(ttl=2, sent=3, received=0),
+        ])
+    out = render.render_loss_summary(t)
+    assert "not reached" in out.lower()
+    assert "end-to-end latency" not in out.lower()
+    assert "0% loss" not in out
 
 
 def test_bar_renders():

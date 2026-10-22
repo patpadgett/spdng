@@ -366,6 +366,19 @@ def test_trace_table_is_aligned():
     assert "ooo" in out
 
 
+def test_trace_table_marks_approximate_rtts():
+    style.set_color(False)
+    from spdng.traceroute import Hop, TraceResult
+
+    t = TraceResult(target="1.1.1.1", hops=[
+        Hop(ttl=1, addr="10.0.0.1", sent=3, received=3,
+            rtts_ms=[1.0, 2.0, 3.0], rtt_approximate=True),
+    ])
+    out = frames.trace_table(t)
+    assert "~1.00 ms" in out
+    assert "~2.00 ms" in out
+
+
 # --------------------------------------------------------------------------
 # the comparison view
 # --------------------------------------------------------------------------

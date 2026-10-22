@@ -158,8 +158,11 @@ def trace_table(trace) -> str:
         else:
             role = "good"
 
-        def ms(value):
-            return f"{value:.2f} ms" if value is not None else "---"
+        def ms(value, approximate=hop.rtt_approximate):
+            if value is None:
+                return "---"
+            prefix = "~" if approximate else ""
+            return f"{prefix}{value:.2f} ms"
 
         t.add_row([
             str(hop.ttl),

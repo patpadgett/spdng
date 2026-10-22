@@ -11,6 +11,8 @@ be dropped, not printed.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from spdng import render, style
@@ -237,6 +239,36 @@ def test_the_trace_row_formats_a_hop():
     assert "192.168.1.1" in row
     assert "0.0%" in row
     assert "1.00 ms" in row
+
+
+def test_the_trace_row_marks_approximate_rtts():
+    from spdng.cli import _trace_header, _trace_row
+    from spdng.traceroute import Hop
+
+    hop = Hop(ttl=1, addr="192.168.1.1", sent=3, received=3,
+              rtts_ms=[1.0, 2.0, 3.0], rtt_approximate=True)
+    row = _trace_row(hop, _trace_header())
+    assert "~1.00 ms" in row
+    assert "~2.00 ms" in row
+
+
+def test_the_streaming_trace_prints_errors(monkeypatch, capsys):
+    from spdng import cli, traceroute
+
+    monkeypatch.setattr(
+        cli.traceroute, "traceroute",
+        lambda *args, **kwargs: traceroute.TraceResult(
+            target="192.0.2.1", method="none",
+            error="no per-hop tracing method is available"))
+    args = SimpleNamespace(max_hops=1, probes=1, timeout=0.1, method="auto")
+
+    rc = cli._stream_trace_plain(
+        "192.0.2.1", 33434, args, cli._trace_header())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "no per-hop tracing method is available" in out
+    assert "not reached" in out.lower()
 
 
 def test_the_trace_row_of_a_dead_hop():

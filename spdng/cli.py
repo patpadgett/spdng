@@ -440,7 +440,10 @@ def _trace_row(hop, columns) -> str:
         role = "good"
 
     def ms(value):
-        return f"{value:.2f} ms" if value is not None else "---"
+        if value is None:
+            return "---"
+        prefix = "~" if hop.rtt_approximate else ""
+        return f"{prefix}{value:.2f} ms"
 
     values = {
         "Hop": f"{hop.ttl}",
@@ -459,6 +462,16 @@ def _trace_row(hop, columns) -> str:
     return " " + " ".join(
         pad(values.get(title, ""), width, align)
         for title, width, align in columns)
+
+
+def _print_trace_tail(trace) -> None:
+    """Print the verdict after a streaming trace, including its error."""
+    print()
+    summary = render.render_loss_summary(trace)
+    if trace.error and trace.error not in summary:
+        print(style.paint(f"  {trace.error}", "bad"))
+    print(summary)
+    print()
 
 
 def _stream_trace_plain(ip: str, port: int, args, columns) -> int:
@@ -483,9 +496,7 @@ def _stream_trace_plain(ip: str, port: int, args, columns) -> int:
         ip, port=port, max_hops=args.max_hops, probes=args.probes,
         timeout=args.timeout, method=args.method, on_hop=on_hop)
 
-    print()
-    print(render.render_loss_summary(trace))
-    print()
+    _print_trace_tail(trace)
     return 0
 
 
@@ -510,9 +521,7 @@ def _stream_trace_curses(ip: str, port: int, args, columns) -> int:
             ip, port=port, max_hops=args.max_hops, probes=args.probes,
             timeout=args.timeout, method=args.method, on_hop=on_hop)
 
-    print()
-    print(render.render_loss_summary(trace))
-    print()
+    _print_trace_tail(trace)
     return 0
 
 
