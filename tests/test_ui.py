@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from spdng import compare, frames, render, style, table
+from spdng import compare, frames, measure, render, style, table
 from spdng.tui import (
     PROBE_ERROR,
     PROBE_OK,
@@ -310,6 +310,7 @@ def test_skipped_directions_are_explicit_in_every_summary():
     r = _result()
     r.download_mbps = None
     r.upload_mbps = None
+    r.latency = measure.LatencyResult()
 
     assert "skipped" in render.render_result(r).lower()
     assert "skipped" in frames.result_table(r).lower()

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import socket
 import sys
 import time
@@ -197,20 +198,39 @@ def cmd_speedtest(args) -> int:
 
 
 def _write_report(result, args, provider) -> str:
-    """Write a result to a file, in the format the extension asks for."""
-    import os
-    if args.save_dir:
-        os.makedirs(args.save_dir, exist_ok=True)
-        base = args.save_dir
+    """Write a result to the exact path requested by ``--save``.
+
+    The extension chooses the format. A path with no extension gets
+    ``.txt``. When the requested path is a directory, or when only a bare
+    filename is given with ``--save-dir``, generate a timestamped name
+    inside that directory instead of throwing the requested name away.
+    """
+    requested = os.path.expanduser(args.save)
+    suffix = os.path.splitext(requested)[1]
+    ext = suffix.lstrip(".").lower() or "txt"
+    directory = args.save_dir
+    if directory:
+        directory = os.path.expanduser(directory)
+
+    target_is_dir = os.path.isdir(requested) or requested.endswith(os.sep)
+    if target_is_dir:
+        target_dir = (os.path.join(directory, requested)
+                      if directory and not os.path.isabs(requested)
+                      else requested)
+        filename = f"result-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+        path = os.path.join(target_dir, filename)
     else:
-        xdg = os.environ.get("XDG_DATA_HOME")
-        root = xdg if xdg else os.path.join(os.path.expanduser("~"),
-                                           ".local", "share")
-        base = os.path.join(root, "spdng", "reports")
-        os.makedirs(base, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    ext = os.path.splitext(args.save)[1].lstrip(".") or "txt"
-    path = os.path.join(base, f"result-{stamp}.{ext}")
+        if not suffix:
+            requested += ".txt"
+        if directory and not os.path.isabs(requested):
+            path = os.path.join(directory, requested)
+        else:
+            path = requested
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     if ext == "csv":
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(frames.result_to_csv(result))
@@ -253,7 +273,12 @@ def cmd_compare(args) -> int:
         if trace is not None:
             traces[provider.id] = trace
 
-    good = [r for r in results if r is not None]
+    good = []
+    good_titles = []
+    for result, title in zip(results, titles, strict=False):
+        if result is not None:
+            good.append(result)
+            good_titles.append(title)
     if not good:
         print("spdng: every provider failed", file=sys.stderr)
         return 1
@@ -261,7 +286,7 @@ def cmd_compare(args) -> int:
     if args.json:
         payload = {
             "results": [r.to_dict() for r in good],
-            "providers": titles,
+            "providers": good_titles,
         }
         if traces:
             payload["traces"] = {k: v.to_dict() for k, v in traces.items()}
@@ -269,7 +294,7 @@ def cmd_compare(args) -> int:
         return 0
 
     print()
-    print(compare.render_comparison(good, titles))
+    print(compare.render_comparison(good, good_titles))
     print()
     for pid, trace in traces.items():
         print(style.paint(f"Path to {pid}", "heading"))

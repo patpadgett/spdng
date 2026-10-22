@@ -65,6 +65,10 @@ def render_comparison(results: Sequence[SpeedTestResult],
 
     n = len(results)
     titles = list(titles) if titles else [f"#{i + 1}" for i in range(n)]
+    if len(titles) < n:
+        titles.extend(f"#{i + 1}" for i in range(len(titles), n))
+    elif len(titles) > n:
+        titles = titles[:n]
 
     # Layout: the numeric rows live in strict columns so they line up and
     # can be compared at a glance. The server details get their own lines,
@@ -108,7 +112,8 @@ def render_comparison(results: Sequence[SpeedTestResult],
     uploads = [r.upload_mbps for r in results]
     pings = [r.latency.avg_ms for r in results]
     jitters = [r.latency.jitter_ms for r in results]
-    losses = [r.latency.loss_pct for r in results]
+    losses = [r.latency.loss_pct if r.latency.attempts else None
+              for r in results]
 
     out.append(row("Download", [
         style.paint(_fmt(v, "Mbit/s"), "good" if v and v > 10 else "value")

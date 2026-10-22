@@ -463,6 +463,98 @@ def test_no_latency_is_rendered_as_skipped_not_failed():
     assert "not measured" in frames.result_to_csv(result)
 
 
+def test_save_uses_the_requested_filename(tmp_path):
+    from spdng.cli import _write_report
+
+    target = tmp_path / "nested" / "my-result.json"
+    args = SimpleNamespace(save=str(target), save_dir=None, no_fun=True)
+    result = measure.SpeedTestResult(server=None)
+    result.download_mbps = 42.0
+
+    path = _write_report(result, args, SimpleNamespace(id="fake"))
+
+    assert path == str(target)
+    assert target.is_file()
+    assert json.loads(target.read_text())["download_mbps"] == 42.0
+
+
+def test_save_dir_is_used_for_a_bare_filename(tmp_path):
+    from spdng.cli import _write_report
+
+    args = SimpleNamespace(save="custom.csv", save_dir=str(tmp_path),
+                           no_fun=True)
+    result = measure.SpeedTestResult(server=None)
+    result.download_mbps = 42.0
+
+    path = _write_report(result, args, SimpleNamespace(id="fake"))
+
+    assert path == str(tmp_path / "custom.csv")
+    assert "download,42.0000" in (tmp_path / "custom.csv").read_text()
+
+
+def test_save_without_an_extension_gets_txt(tmp_path):
+    from spdng.cli import _write_report
+
+    args = SimpleNamespace(save=str(tmp_path / "plain"), save_dir=None,
+                           no_fun=True)
+
+    path = _write_report(measure.SpeedTestResult(server=None), args,
+                         SimpleNamespace(id="fake"))
+
+    assert path == str(tmp_path / "plain.txt")
+    assert (tmp_path / "plain.txt").is_file()
+
+
+def test_compare_keeps_titles_aligned_when_a_provider_fails(monkeypatch):
+    from spdng import cli
+
+    class FakeProvider:
+        def __init__(self, ident, label):
+            self.id = ident
+            self.label = label
+
+    bad = FakeProvider("bad", "Bad")
+    good = FakeProvider("good", "Good")
+
+    def get_provider(name):
+        return bad if name == "bad" else good
+
+    def pick_server(provider, args):
+        if provider is bad:
+            return None, "no server"
+        return object(), None
+
+    class FakeServer:
+        sponsor = "Sponsor"
+        name = "Server"
+        cc = "US"
+        distance_km = 1.0
+        provider = "fake"
+
+    result = measure.SpeedTestResult(server=FakeServer())
+    result.download_mbps = 10.0
+    result.upload_mbps = 1.0
+    result.latency = measure.LatencyResult(
+        samples_ms=[10.0], errors=0, attempts=1)
+
+    monkeypatch.setattr(cli.providers, "get_provider", get_provider)
+    monkeypatch.setattr(cli, "_pick_server", pick_server)
+    monkeypatch.setattr(cli, "_run_one",
+                        lambda *args, **kwargs: (result, None))
+    captured = []
+    monkeypatch.setattr(
+        cli.compare, "render_comparison",
+        lambda results, titles: captured.append((results, titles)) or "ok")
+
+    args = SimpleNamespace(providers=["bad", "good"], json=False,
+                           verbose=False, trace=False, no_color=True)
+    rc = cli.cmd_compare(args)
+
+    assert rc == 0
+    assert len(captured) == 1
+    assert captured[0][1] == ["Good"]
+
+
 def test_doctor_never_raises():
     from spdng.cli import main
     buf = io.StringIO()
