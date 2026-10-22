@@ -249,14 +249,49 @@ def test_trace_falls_back_when_no_method_is_available(monkeypatch):
     """With no raw sockets, no ping, and no UDP, we must say so."""
     monkeypatch.setattr(traceroute, "has_raw_icmp", lambda: False)
     monkeypatch.setattr(traceroute, "has_ping_binary", lambda: False)
+    monkeypatch.setattr(traceroute, "has_recverr", lambda: False)
+    t = traceroute.traceroute("127.0.0.1", max_hops=1, probes=1, timeout=0.2)
+    # No method at all: the trace says so rather than pretending.
+    assert t.error
+    assert t.method == "none"
+    assert not t.hops
+
+
+def test_trace_falls_back_to_udp_when_the_others_are_missing(monkeypatch):
+    """With no raw sockets and no ping, UDP is the last resort."""
+    monkeypatch.setattr(traceroute, "has_raw_icmp", lambda: False)
+    monkeypatch.setattr(traceroute, "has_ping_binary", lambda: False)
+    monkeypatch.setattr(traceroute, "has_recverr", lambda: True)
     t = traceroute.traceroute("127.0.0.1", max_hops=1, probes=1, timeout=0.2)
     assert t.method == "udp"
 
 
+@pytest.mark.skipif(not traceroute.has_recverr(),
+                    reason="IP_RECVERR is Linux-only")
 def test_traceroute_method_udp_never_raises():
     t = traceroute.traceroute("127.0.0.1", port=1, max_hops=2, probes=1,
                               timeout=0.3, method="udp")
     assert t.hops is not None
+    assert not t.error
+
+
+def test_traceroute_method_udp_reports_when_it_cannot_work(monkeypatch):
+    """Where IP_RECVERR does not exist, the UDP backend must not raise.
+
+    macOS has no IP_RECVERR. Setting the socket option there raises
+    ENOPROTOOPT, and that used to come straight out of the trace. The
+    socket option is what fails, so that is what the test breaks.
+    """
+    import socket as _socket
+
+    def no_recverr(self, level, option, value):
+        raise OSError(42, "Protocol not available")
+
+    monkeypatch.setattr(_socket.socket, "setsockopt", no_recverr)
+    t = traceroute.traceroute("127.0.0.1", port=1, max_hops=2, probes=1,
+                              timeout=0.3, method="udp")
+    assert t.error
+    assert not t.hops
 
 
 # --------------------------------------------------------------------------

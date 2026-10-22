@@ -1,5 +1,11 @@
 # spdng
 
+[![CI](https://github.com/patpadgett/spdng/actions/workflows/test.yml/badge.svg)](https://github.com/patpadgett/spdng/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/spdng.svg)](https://pypi.org/project/spdng/)
+[![Python](https://img.shields.io/pypi/pyversions/spdng.svg)](https://pypi.org/project/spdng/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](pyproject.toml)
+
 A maintained speedtest CLI that tells you **where** your speed is going, not
 just how much you have.
 
@@ -19,33 +25,59 @@ speedtest-cli never had:
 - a **local history**, so you can see whether your connection is getting
   worse
 
+### What is different
+
+| | speedtest-cli | spdng |
+|---|---|---|
+| Latency | measured on a **cold** connection, so it included the TCP and TLS handshake. A slow handshake dragged the average up by hundreds of milliseconds. | measured on a **warm** connection, so it is the round trip and not the setup cost. The handshake is reported separately. |
+| Failed probes | became a **30-minute placeholder** (exactly `1800000.0` ms) and were averaged in with the real ones. | reported as **loss**, and never as a number. |
+| HTTP redirects | not followed, so every latency probe against a current server **failed**. | followed, using the canonical host so there is no extra round trip. |
+| Server choice | a static, non-geo-aware list, so it measured against a server **1,753 km away**. | the nearest server, ranked by distance. |
+| Path analysis | none | an mtr-style per-hop trace, with loss, latency and a probe history per hop. |
+| Providers | Ookla only | Ookla, Cloudflare and LibreSpeed, side by side, so you can tell a slow link from a slow route. |
+| Dependencies | none | none, still. |
+
 ```
 $ spdng speedtest --trace
 
-Hosted by Blue Stream Fiber (Miami, FL) [US] 5 km
-Ping: 50.23 ms   jitter: 5.38 ms   loss: 0%
-Download: 237.45 Mbit/s   Upload: 9.99 Mbit/s
++- spdng result -----------------------------------------------------+
+| Metric   |                       Value | Detail                    |
++--------------------------------------------------------------------+
+| Server   | Blue Stream Fiber Miami, FL | [US] 5 km                 |
+| Provider |                       ookla |                           |
+| Ping     |                    45.65 ms | jitter 11.01 ms   loss 0% |
+| Download |               232.34 Mbit/s | 10.6 MB in 0.4s           |
+| Upload   |                 3.36 Mbit/s | 2.5 MB in 5.9s            |
+| Grade    |                           A | very good                 |
++--------------------------------------------------------------------+
 
-Hop   Loss%  Snt       Last        Avg       Best      Worst   Jitter  Address
-------------------------------------------------------------------------------
-  1    0.0%    3   ~3.79 ms   ~4.59 ms    3.79 ms    5.07 ms     0.64  192.168.1.1
-  2    0.0%    3   ~4.58 ms   ~4.42 ms    3.82 ms    4.86 ms     0.90  72.187.94.43
- 10    0.0%    3  ~18.49 ms  ~20.20 ms   18.49 ms   21.86 ms     1.69  66.109.6.96
- 11    0.0%    3  ~27.13 ms  ~24.88 ms   21.52 ms   27.13 ms     2.80  66.109.5.127
- 12    0.0%    3  ~22.80 ms  ~20.42 ms   18.51 ms   22.80 ms     2.14  208.116.217.205
- 13    0.0%    3  ~19.97 ms  ~25.66 ms   19.97 ms   35.32 ms     7.67  89.149.133.226
- 14    0.0%    3  ~24.40 ms  ~22.32 ms   19.87 ms   24.40 ms     3.67  74.199.177.10
- 15    0.0%    3  ~28.40 ms  ~25.31 ms   20.42 ms   28.40 ms     7.33  139.138.78.174
- 16    0.0%    3  ~35.98 ms  ~52.04 ms   31.66 ms   88.49 ms    30.57  139.138.78.181
- 17    0.0%    2   21.00 ms   23.25 ms   21.00 ms   25.50 ms     4.50  139.138.79.141
++- path to 139.138.79.141 ----------------------------------------------+
+| Hop |  Loss% | Snt |     Last |      Avg |     Best |     Worst |   Jitter | History | Address         |
++------------------------------------------------------------------------+
+|   1 |   0.0% |   3 |  5.67 ms |  9.69 ms |  3.96 ms |  19.43 ms |  8.59 ms | ...     | 192.168.1.1     |
+|   2 |   0.0% |   3 |  4.45 ms |  4.14 ms |  3.70 ms |   4.45 ms |  0.65 ms | ...     | 72.187.94.43    |
+|   3 | 100.0% |   3 |      --- |      --- |      --- |       --- |      --- | ooo     | *               |
+|   9 |  33.3% |   3 | 43.89 ms | 29.17 ms | 14.45 ms |  43.89 ms | 29.44 ms | ..o     | 71.44.3.118     |
+|  10 |   0.0% |   3 | 64.72 ms | 49.09 ms | 33.32 ms |  64.72 ms | 15.70 ms | ...     | 66.109.6.96     |
+|  11 |   0.0% |   3 | 20.34 ms | 24.50 ms | 20.34 ms |  27.78 ms |  3.72 ms | ...     | 66.109.5.127    |
+|  12 |   0.0% |   3 | 54.12 ms | 47.13 ms | 43.53 ms |  54.12 ms |  5.29 ms | ...     | 208.116.217.205 |
+|  13 |   0.0% |   3 | 36.36 ms | 38.21 ms | 34.25 ms |  44.00 ms |  8.69 ms | ...     | 89.149.133.226  |
+|  16 |   0.0% |   3 | 68.40 ms | 94.25 ms | 68.40 ms | 119.81 ms | 38.35 ms | ...     | 139.138.78.181  |
+|  17 |   0.0% |   3 | 53.40 ms | 39.53 ms | 32.30 ms |  53.40 ms | 10.85 ms | ...     | 139.138.79.141  |
++------------------------------------------------------------------------+
 
-Destination reached
-
-Final hop: 0% loss over 2 probes
-No significant latency jump across the path; end-to-end latency 23.2 ms
+Final hop: 0% loss over 3 probes
+Latency jump at hop 9 (71.44.3.118): 29.2 ms - upstream congestion begins here
 ```
 
-A `~` marks an RTT we estimated ourselves rather than one the kernel
+The `History` column is the mtr convention: `.` is a probe that came
+back, `o` is one that timed out, `O` is one that was refused and `X`
+is one that hit an error. A column of `.........o..` says the link is
+fine with an occasional blip. A column of `oooOOXXXXX` says the hop is
+down, and the tool says so in words rather than making you read rows of
+`*`.
+
+The `~` marks an RTT we estimated ourselves rather than one the kernel
 reported. See [Measurement honesty](#measurement-honesty).
 
 ---

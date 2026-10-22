@@ -183,6 +183,8 @@ def test_icmp_checksum_is_self_consistent():
     assert traceroute._checksum(full) == 0
 
 
+@pytest.mark.skipif(not traceroute.has_recverr(),
+                    reason="IP_RECVERR is Linux-only")
 def test_recverr_probe_does_not_claim_arrival_on_local_refusal(monkeypatch):
     """A local ECONNREFUSED must not be reported as reaching the destination."""
     import socket as _socket
@@ -193,6 +195,22 @@ def test_recverr_probe_does_not_claim_arrival_on_local_refusal(monkeypatch):
     monkeypatch.setattr(_socket.socket, "send", fake_send)
     addr, rtt, reached = traceroute._recverr_probe("127.0.0.1", 9, 1, 0.2)
     assert reached is False
+
+
+@pytest.mark.skipif(traceroute.has_recverr(),
+                    reason="only relevant where IP_RECVERR is missing")
+def test_the_udp_backend_says_so_where_recverr_is_missing():
+    """Where IP_RECVERR does not exist, the trace must say so.
+
+    macOS has no IP_RECVERR, so the UDP traceroute backend cannot work
+    there. It has to say that rather than raising out of the middle of
+    a trace.
+    """
+    result = traceroute.traceroute("127.0.0.1", method="udp",
+                                    max_hops=2, probes=1, timeout=0.5)
+    assert result.error
+    assert "IP_RECVERR" in result.error or "not available" in result.error
+    assert not result.hops
 
 
 # --------------------------------------------------------------------------

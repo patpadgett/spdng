@@ -41,6 +41,29 @@ _PING_OVERHEAD_MS: float | None = None
 
 IP_RECVERR = 11
 IP_TTL = 2
+
+#: Does this platform have IP_RECVERR? It is Linux-only: on macOS the
+#: socket option does not exist, and setting it raises ENOPROTOOPT
+#: ("Protocol not available"). The UDP traceroute backend depends on
+#: the socket's error queue, so it cannot work there.
+_HAS_RECVERR = hasattr(socket, "IP_RECVERR")
+
+
+def has_recverr() -> bool:
+    """Can this platform deliver ICMP errors to an unprivileged UDP socket?"""
+    if not _HAS_RECVERR:
+        return False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    return True
 IP_MTU_DISCOVER = 10
 SOL_IPV6 = 41
 IPV6_RECVERR = 26
@@ -256,7 +279,13 @@ def _recverr_probe(host: str, port: int, ttl: int,
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+        except OSError as exc:
+            # No error queue on this platform, so this backend cannot
+            # work. Say so rather than raising out of a trace.
+            raise TraceUnavailable(
+                f"IP_RECVERR is not available here: {exc}") from exc
         sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, 2)  # PMTU discovery
         sock.settimeout(timeout)
         sock.connect((host, port))
@@ -578,8 +607,16 @@ def traceroute(
             method = "icmp"
         elif has_ping_binary():
             method = "ping"
-        else:
+        elif has_recverr():
             method = "udp"
+        else:
+            # Nothing here can trace per hop. Say so, rather than
+            # starting a trace that cannot work.
+            result = TraceResult(target=host, method="none")
+            result.error = (
+                "no per-hop tracing method is available here: no raw "
+                "ICMP sockets, no ping binary, and no IP_RECVERR")
+            return result
 
     result = TraceResult(target=host, method=method)
 
@@ -592,7 +629,14 @@ def traceroute(
             return result
     if method == "ping":
         return _trace_ping(host, max_hops, probes, timeout, result, on_hop)
-    return _trace_udp(host, port, max_hops, probes, timeout, result, on_hop)
+    if method == "udp":
+        try:
+            return _trace_udp(host, port, max_hops, probes, timeout, result,
+                              on_hop)
+        except TraceUnavailable as exc:
+            result.error = str(exc)
+            return result
+    return result
 
 
 def _resolved_ip(host: str) -> str:
@@ -683,9 +727,20 @@ def probe_loss_and_latency(host: str, port: int = 33434, count: int = 10,
             sock.connect((host, port))
             received += 1
             rtts.append((time.perf_counter() - start) * 1000)
+            # Half-close rather than just closing. Closing a socket we
+            # never read from sends a RST, and on macOS the next
+            # connect to the same listener can be refused - which
+            # reads as a lost packet when it is not one.
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
         except (TimeoutError, OSError):
             pass
         finally:
             sock.close()
+        # Give the peer a moment to notice the close before the next
+        # probe, so the two do not overlap.
+        time.sleep(0.01)
     loss = (count - received) * 100.0 / count if count else 100.0
     return loss, rtts
