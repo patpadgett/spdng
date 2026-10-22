@@ -129,7 +129,10 @@ class SpeedTestResult:
                 "min_ms": self.latency.min_ms,
                 "max_ms": self.latency.max_ms,
                 "jitter_ms": self.latency.jitter_ms,
-                "loss_pct": round(self.latency.loss_pct, 1),
+                # No attempts means the latency probe was skipped, not
+                # that every probe failed. Do not turn that into 100% loss.
+                "loss_pct": (round(self.latency.loss_pct, 1)
+                             if self.latency.attempts else None),
                 "samples_ms": [round(s, 2) for s in self.latency.samples_ms],
             },
             "download": {

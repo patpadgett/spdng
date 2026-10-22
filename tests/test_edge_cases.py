@@ -609,6 +609,18 @@ def test_no_latency_is_rendered_as_skipped_not_failed():
     assert "not measured" in frames.result_to_csv(result)
 
 
+def test_no_latency_json_does_not_report_loss():
+    """Skipping the probe is not the same as every probe failing."""
+    result = measure.SpeedTestResult(server=None)
+    result.latency = measure.LatencyResult()
+
+    latency = result.to_dict()["latency"]
+
+    assert latency["avg_ms"] is None
+    assert latency["loss_pct"] is None
+    assert latency["samples_ms"] == []
+
+
 def test_save_uses_the_requested_filename(tmp_path):
     from spdng.cli import _write_report
 
