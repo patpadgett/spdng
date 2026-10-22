@@ -10,6 +10,7 @@ from collections.abc import Sequence
 
 from . import style
 from .measure import SpeedTestResult
+from .table import pad
 
 
 def _shorten(text: str, width: int) -> str:
@@ -79,7 +80,10 @@ def render_comparison(results: Sequence[SpeedTestResult],
     label_w = 11
 
     def row(label: str, values: list[str]) -> str:
-        cells = "".join(f"{v:<{col_w}}" for v in values)
+        # Visible-width padding, not len(): a coloured value would
+        # otherwise lose its trailing spaces and shift every later
+        # column left by the length of the escape sequence.
+        cells = "".join(pad(v, col_w, "<") for v in values)
         return f"{label:<{label_w}}{cells}"
 
     header = "".join(f"{t[:col_w - 1]:<{col_w}}" for t in titles)

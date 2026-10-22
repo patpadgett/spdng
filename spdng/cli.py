@@ -759,8 +759,8 @@ def _result_from_sample(sample):
     r.download_mbps = sample.download_mbps
     r.upload_mbps = sample.upload_mbps
     r.latency = measure.LatencyResult(
-        samples_ms=[sample.ping_ms] if sample.ping_ms else [], errors=0,
-        attempts=1)
+        samples_ms=[sample.ping_ms] if sample.ping_ms is not None else [],
+        errors=0, attempts=1)
     return r
 
 

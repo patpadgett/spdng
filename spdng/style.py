@@ -61,6 +61,11 @@ class Theme:
         return CODES.get(getattr(self, role, "white"), "37")
 
 
+#: The semantic roles every theme names. Anything else passed to paint()
+#: is either a raw colour from CODES or a typo that should be ignored.
+THEME_ROLES = ("good", "ok", "warn", "bad", "accent", "muted",
+               "heading", "value")
+
 THEMES: dict[str, Theme] = {
     "default": Theme(
         name="default", label="default",
@@ -108,7 +113,7 @@ def _detect_color() -> bool:
         return True
     if os.environ.get("TERM") == "dumb":
         return False
-    if os.environ.get("SPDGNG_NO_COLOR"):
+    if os.environ.get("SPDNG_NO_COLOR") is not None:
         return False
     try:
         return sys.stdout.isatty()
@@ -140,10 +145,21 @@ def theme() -> Theme:
 
 
 def paint(text: str, role: str) -> str:
-    """Wrap text in the theme colour for a role."""
+    """Wrap text in a theme role or a raw colour name.
+
+    Themes name semantic roles such as "good"; raw names such as "red"
+    and "bold" are ANSI codes and must not be looked up as theme
+    attributes. An unknown role is returned unchanged rather than being
+    printed as literal text in an escape sequence.
+    """
     if not color_enabled():
         return text
-    code = _theme.code(role)
+    if role in THEME_ROLES:
+        code = _theme.code(role)
+    elif role in CODES:
+        code = CODES[role]
+    else:
+        return text
     return f"\033[{code}m{text}{RESET}"
 
 

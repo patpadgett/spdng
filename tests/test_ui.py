@@ -6,8 +6,6 @@ wrong silently misaligns every column after the first coloured one.
 """
 from __future__ import annotations
 
-import pytest
-
 from spdng import compare, frames, measure, render, style, table
 from spdng.tui import (
     PROBE_ERROR,
@@ -543,7 +541,6 @@ def test_comparison_rows_line_up():
         assert line[11] != " ", f"row is not indented to the label column: {line!r}"
 
 
-@pytest.mark.xfail(strict=True, reason="compare pads ANSI strings with len()")
 def test_comparison_rows_line_up_with_colour():
     """Numbers must stay in their columns when colour is enabled."""
     style.set_color(True)

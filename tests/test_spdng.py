@@ -475,6 +475,33 @@ def test_force_color_env_enables_colour(monkeypatch):
     assert "\033[" in style.paint("hello", "red")
 
 
+def test_raw_colour_names_are_not_theme_roles():
+    from spdng import style
+    style.set_color(True)
+    try:
+        assert style.paint("x", "red") == "\033[31mx\033[0m"
+        assert style.paint("x", "bold") == "\033[1mx\033[0m"
+    finally:
+        style.set_color(None)
+
+
+def test_an_unknown_style_role_is_left_alone():
+    from spdng import style
+    style.set_color(True)
+    try:
+        assert style.paint("x", "not-a-colour") == "x"
+    finally:
+        style.set_color(None)
+
+
+def test_the_correct_spdng_no_color_env_is_honoured(monkeypatch):
+    from spdng import style
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("SPDNG_NO_COLOR", "1")
+    style.set_color(None)
+    assert style.color_enabled() is False
+
+
 def test_no_color_beats_force_color(monkeypatch):
     from spdng import style
     monkeypatch.setenv("NO_COLOR", "1")

@@ -108,7 +108,7 @@ class WatchView:
             if width and len(line) + len(extra) > width:
                 break
             line += extra
-        return line
+        return line[:width] if width else line
 
     def render_lines(self, width: int = 100, height: int = 0) -> list[str]:
         """The frame as a list of strings.
@@ -141,9 +141,12 @@ class WatchView:
         # truncates by one character each time never ends.)
         while len(f"{prefix}{target}   {stats}") > width and target:
             target = target[:-1]
-        out.append(style.paint(f"{prefix}{target}   {stats}", "heading"))
+        header = f"{prefix}{target}   {stats}"
+        if len(header) > width:
+            header = header[:width]
+        out.append(style.paint(header, "heading"))
         if self.message:
-            out.append(style.paint(f" {self.message}", "muted"))
+            out.append(style.paint(f" {self.message}"[:width], "muted"))
         out.append("")
 
         if not self.samples:
@@ -161,8 +164,10 @@ class WatchView:
         peak_up = max(ups) if ups else None
         peak_ping = max(pings) if pings else 1
 
-        # The graph takes the whole width, less room for the label.
-        graph_width = max(20, width - 34)
+        # The graph leaves room for the indent, the current value, and
+        # the unit. Never force a 20-column bar onto a narrower terminal:
+        # that is how the stat bar used to overflow at 40 columns.
+        graph_width = max(1, min(60, width - 19))
 
         # Download bar graph
         out.append(style.paint("  Download", "heading"))
@@ -216,10 +221,12 @@ class WatchView:
         out.append("")
         chart_height = self._chart_height(height, len(out) + 2)
 
-        if self.show_upload:
+        if self.show_upload and width >= 50:
             # Side by side. Each half gets an equal share of the width.
             # A half is: 2 spaces of indent, the spark, a space, and an
             # 8-character value, plus a 4-space gap between the halves.
+            # Below 50 columns that minimum does not fit, so the charts
+            # are stacked instead of being drawn past the right edge.
             half = max(24, (width - 4) // 2)
             spark_width = max(10, half - 11)
             dl_rows = self._chart_rows(dls, chart_height, spark_width)
@@ -234,13 +241,6 @@ class WatchView:
 
             # A row is: 2 indent + spark + 1 space + 7 for the value,
             # then a 4-space gap before the second half.
-            # The headings sit over the sparks, which start at column
-            # 2 of each half.
-            # The headings sit over the sparks. The first spark starts
-            # at column 2, and the second at column spark_width + 16.
-            # The upload spark starts at column spark_width + 16 in the
-            # data rows: 2 indent + spark + 1 space + 7 for the value
-            # + 4 gap + 2 indent. The heading goes there too.
             second_start = spark_width + 16
             out.append(
                 "  " + style.paint("Download over time", "heading")
@@ -258,15 +258,22 @@ class WatchView:
                 out.append(style.paint(left, "accent")
                            + "    " + style.paint(right, "ok"))
         else:
-            # On its own, the download chart takes the whole width.
-            spark_width = max(20, width - 11)
-            dl_rows = self._chart_rows(dls, chart_height, spark_width)
-            out.append(style.paint("  Download over time", "heading"))
-            for i in range(chart_height):
-                spark, value = dl_rows[i]
-                out.append(
-                    "  " + style.paint(spark.ljust(spark_width), "accent")
-                    + f" {value:>7.1f}")
+            # A full-width chart, either because upload is hidden or
+            # because two charts cannot fit side by side.
+            spark_width = max(1, width - 10)
+
+            def full_chart(values: list[float], title: str, role: str) -> None:
+                rows = self._chart_rows(values, chart_height, spark_width)
+                out.append(style.paint(f"  {title}"[:width], "heading"))
+                for spark, value in rows:
+                    line = (("  " + spark.ljust(spark_width))
+                            + f" {value:>7.1f}")
+                    out.append(style.paint(line[:width], role))
+
+            full_chart(dls, "Download over time", "accent")
+            if self.show_upload:
+                out.append("")
+                full_chart(ups, "Upload over time", "ok")
 
 
         out.append("")
